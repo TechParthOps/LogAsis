@@ -91,7 +91,7 @@ API credentials are handled locally by the application and **must not be committ
 ### Requirements
 
 - Windows
-- Python 3.11 recommended
+- Python 3.11 or more recommended
 - A configured live AI provider for AI Analyst features
 
 ### Create a virtual environment
