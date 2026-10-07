@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Local configuration / secrets
+.env
+.env.*
+!.env.example
+
+# LogAsis runtime state and generated data
+runtime/*.log
+runtime/*
+!runtime/.gitkeep
+data/*
+!data/.gitkeep
+exports/*
+!exports/.gitkeep
+
+# Local databases / caches
+*.db
+*.sqlite
+*.sqlite3
+*.cache
+
+# Logs and forensic artifacts
+*.log
+*.pcap
+*.pcapng
+*.evtx
+*.etl
+
+# IDE / OS
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# Build / packaging output
+build/
+dist/
+*.spec
+
+build-onedir/
+
+dist-onedir/

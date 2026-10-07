@@ -1,0 +1,109 @@
+{
+  "benchmark_version": "baseline-1.0",
+  "timestamp": "2026-10-06T14:46:03.955936",
+  "datasets": {
+    "10000": {
+      "event_count": 10000,
+      "results": [
+        {
+          "operation": "generate_synthetic_events",
+          "elapsed_seconds": 0.9488,
+          "peak_memory_mb": 9.45,
+          "result_count": 10000,
+          "status": "ok"
+        },
+        {
+          "operation": "events_to_dataframe",
+          "elapsed_seconds": 0.1434,
+          "peak_memory_mb": 2.67,
+          "result_count": 10000,
+          "status": "ok"
+        },
+        {
+          "operation": "event_index_build",
+          "elapsed_seconds": 2.0116,
+          "peak_memory_mb": 48.62,
+          "result_count": 0,
+          "status": "ok"
+        },
+        {
+          "operation": "filter_value_population",
+          "elapsed_seconds": 0.003,
+          "peak_memory_mb": 0.16,
+          "result_count": 50,
+          "status": "ok"
+        },
+        {
+          "operation": "filter_application",
+          "elapsed_seconds": 0.0137,
+          "peak_memory_mb": 0.82,
+          "result_count": 215,
+          "status": "ok"
+        },
+        {
+          "operation": "event_index_exact_lookup",
+          "elapsed_seconds": 0.0001,
+          "peak_memory_mb": 0.0,
+          "result_count": 215,
+          "status": "ok"
+        },
+        {
+          "operation": "summary",
+          "elapsed_seconds": 0.0068,
+          "peak_memory_mb": 0.33,
+          "result_count": 6,
+          "status": "ok"
+        },
+        {
+          "operation": "build_investigation_report",
+          "elapsed_seconds": 8.0323,
+          "peak_memory_mb": 8.78,
+          "result_count": 9,
+          "status": "ok"
+        },
+        {
+          "operation": "extract_iocs",
+          "elapsed_seconds": 7.056,
+          "peak_memory_mb": 10.64,
+          "result_count": 6,
+          "status": "ok"
+        },
+        {
+          "operation": "detection_engine",
+          "elapsed_seconds": 0.2738,
+          "peak_memory_mb": 1.94,
+          "result_count": 4,
+          "status": "ok"
+        },
+        {
+          "operation": "build_evidence_manifest",
+          "elapsed_seconds": 0.7879,
+          "peak_memory_mb": 8.93,
+          "result_count": 6,
+          "status": "ok"
+        },
+        {
+          "operation": "rag_index_build",
+          "elapsed_seconds": 21.0355,
+          "peak_memory_mb": 65.88,
+          "result_count": 0,
+          "status": "ok"
+        },
+        {
+          "operation": "rag_retrieval",
+          "elapsed_seconds": 20.9477,
+          "peak_memory_mb": 6.47,
+          "result_count": 0,
+          "status": "ok"
+        },
+        {
+          "operation": "full_background_analysis",
+          "elapsed_seconds": 18.0913,
+          "peak_memory_mb": 30.77,
+          "result_count": 4,
+          "status": "ok"
+        }
+      ]
+    }
+  }
+}
