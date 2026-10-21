@@ -1,243 +1,198 @@
 # LogAsis
 
-LogAsis is a Windows desktop security-investigation workspace for analyzing security logs, correlating events, reviewing evidence, and using live AI for evidence-grounded investigation.
+**LogAsis** is a log analysis and security investigation tool designed to help analysts search log files, examine events, investigate suspicious activity, and use AI-assisted analysis to answer questions about available evidence.
 
-## Current release
+[![Version](https://img.shields.io/badge/version-0.10.0-blue)](https://github.com/TechParthOps/LogAsis)
+[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)](https://github.com/TechParthOps/LogAsis)
 
-**v0.9.7 — Stable AI answers across installs and runs**
+**Repository:** https://github.com/TechParthOps/LogAsis
+
+## Overview
+
+LogAsis combines log processing, event indexing, searching, aggregation, correlation, and AI-assisted investigation in a single application.
+
+Its goal is to make log investigations more efficient while keeping findings connected to the underlying records. AI-generated interpretations should be verified against the source evidence and the coverage of the loaded dataset.
 
 ## Features
 
-- Security-log parsing and normalized event analysis
-- JSON security-log support, including vendor-specific/custom fields
-- Syslog-style text-log support
-- Dynamic event filtering with selectable field values — no manual value entry required
-- Cross-event correlation and timeline analysis
-- Source/destination IP and authentication analysis
-- Findings, evidence, and case workflows
-- AI-directed investigation over the currently loaded log
-- Dynamic retrieval across populated log fields
-- Evidence IDs and claim-level grounding
-- Human-readable AI answers rather than raw provider JSON
-- Deterministic evidence and provenance validation around AI-generated interpretations
-- Live AI provider support through the application's configuration UI
-- NVIDIA NIM support with analyst-model validation
-- Session-local AI result caching; no persistent AI answer cache
-- No local LLM or Ollama dependency
+- **Log ingestion and parsing:** Load supported log files and convert records into a searchable representation.
+- **Event indexing:** Find relevant records using available fields and query filters.
+- **Event aggregation:** Calculate counts and summarize matching events.
+- **Timeline analysis:** Examine the sequence and timing of relevant events.
+- **Event correlation:** Investigate relationships among events using available timestamps, hosts, IP addresses, users, process information, and other fields.
+- **AI Analyst:** Ask natural-language questions about loaded log data using a configured AI provider.
+- **Evidence-based investigation:** Review supporting records and distinguish observations from interpretations where supported by the implementation.
+- **Provider integration:** Use the AI providers and compatible endpoints supported by the current configuration.
+- **Desktop interface:** Access the log-analysis workflows through the application's graphical interface.
 
-## Architecture
+Refer to the actual source code and release notes for the exact features and integrations included in version 0.10.0.
 
-```text
-Uploaded security log
-        |
-        v
-Parser / normalized event records
-        |
-        v
-Persistent LogDataset (EventIndex + QueryEngine + AggregationEngine)
-        |
-        +----> Dashboard / Events / Timeline / IP / Authentication
-        |
-        v
-Evidence identity + read-only investigation tools
-        |
-        +----> Search (indexed)
-        +----> Entity context (indexed)
-        +----> Timeline (indexed)
-        +----> Correlation (indexed)
-        +----> Overview (cached)
-        |
-        v
-Live AI provider
-        |
-        v
-Claim-level grounding / citation validation
-        |
-        v
-Human-readable analyst report
-```
+## AI Analyst: Accuracy and Reliability
 
-LogAsis preserves populated source fields, including vendor-specific JSON fields, so those fields can be searched without adding a new hard-coded forensic rule.
+AI-generated answers can be incorrect when relevant records are missing, retrieval is incomplete, or conclusions go beyond the available evidence.
 
-The AI is **not** treated as the source of truth. Concrete claims are checked against evidence references before they are presented as analyst findings. When the evidence supports only an observation or inference, LogAsis keeps the wording qualified instead of turning an inference into a fact.
+LogAsis should be evaluated against the following reliability principles:
 
-## Indexing
+1. **Evidence before conclusions:** Important claims should be traceable to source events or reproducible query results.
+2. **Accurate counts:** Numerical answers should be computed from the complete matching dataset rather than estimated from a sample of events.
+3. **Coverage awareness:** Partial results, failed queries, and truncated evidence should be identified.
+4. **Careful correlation:** Events occurring close together do not automatically establish causation.
+5. **Explicit uncertainty:** When the logs are insufficient, the analyst should explain what is known and what remains unproven.
+6. **Reproducible evaluation:** Changes to retrieval, prompts, or investigation logic should be checked against repeatable tests.
 
-LogAsis builds a persistent indexed representation of the loaded dataset:
+These are reliability goals, not a guarantee that every answer is correct. Validate the implemented behavior with the test suite and benchmark results for this release.
 
-- **Exact inverted indexes**: field -> value -> row IDs
-- **Token inverted index**: token -> row IDs
-- **Timestamp index**: sorted array for O(log n) range queries
-- **Entity indexes**: IP, user, process, PID, file, hash, domain, URL, CVE
-- **Correlation indexes**: session, request, trace, transaction, flow, PID
-- **Prefix indexes**: for high-cardinality fields
+## Installation
 
-The index is built once during ingestion and reused for all operations. Filtering is a VIEW operation that queries the index without rebuilding it.
+### Option 1: Download a published release
 
-## Performance
+Visit the [LogAsis Releases page](https://github.com/TechParthOps/LogAsis/releases).
 
-| Operation | Before | After | Speedup |
-|-----------|--------|-------|---------|
-| Filter value population | O(rows) | O(distinct) | 30x |
-| Filter application | O(rows) | O(1) | 7.6x |
-| Exact query | O(rows) | O(1) | 100x+ |
-| Facet counts | O(rows) | O(distinct) | 50x+ |
-| Time range | O(rows) | O(log n) | 100x+ |
+1. Select the required release.
+2. Download an installer or executable if one is attached.
+3. Review the release notes and any published checksums.
+4. Follow the installation instructions provided with that release.
 
-## Supported input
+Only use assets actually published for version 0.10.0.
 
-The current release includes parsers for:
+### Option 2: Run from source
 
-- **JSON security logs**, including structured/vendor-specific fields
-- **Syslog-style text logs**
-
-The JSON parser supports structured records, newline-delimited JSON (NDJSON), wrapped JSON exports, and other supported JSON layouts handled by the parser layer.
-
-Additional formats can be added through the parser layer.
-
-## AI configuration
-
-AI configuration is performed through the LogAsis UI.
-
-The current provider layer supports:
-
-- OpenAI
-- Google Gemini
-- NVIDIA NIM
-- Configurable OpenAI-compatible endpoints
-
-Provider model catalogs can be discovered from the configured provider where supported.
-
-API credentials are handled locally by the application and **must not be committed to Git**.
-
-> LogAsis requires an appropriately configured live AI provider for AI Analyst functionality. Core log parsing, event views, filtering, and deterministic analysis do not depend on a local LLM.
-
-## Installation from source
-
-### Requirements
-
-- Windows
-- Python 3.11 or more recommended
-- A configured live AI provider for AI Analyst features
-
-### Create a virtual environment
+Clone the repository:
 
 ```powershell
-py -3.11 -m venv .venv
+git clone https://github.com/TechParthOps/LogAsis.git
+cd LogAsis
+git checkout v0.10.0
 ```
 
-Activate it:
+Create a virtual environment using a Python version supported by the project:
 
 ```powershell
+py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Upgrade pip:
+Install the dependencies if the repository includes `requirements.txt`:
 
 ```powershell
 python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Install dependencies:
+Launch the application using the entry point documented in the current source tree. For example, if `main.py` is the configured entry point:
 
 ```powershell
-python -m pip install -r requirements.txt
+python main.py
 ```
 
-Start LogAsis:
+If the application uses a different entry point, follow the instructions for that version.
+
+## Using LogAsis
+
+A typical workflow is:
+
+1. Open LogAsis.
+2. Load a supported log file.
+3. Verify the number of records successfully parsed and indexed.
+4. Search for events or ask a question using the AI Analyst.
+5. Review the relevant records, filters, timestamps, and evidence references.
+6. Validate important findings before using them in an incident report.
+
+Example questions include:
+
+- How many failed login attempts came from a particular IP address?
+- Which events occurred on a specified host during a given time range?
+- What happened before and after a suspicious process execution?
+- Which records support or contradict a suspected incident?
+- Does the available evidence establish compromise, or is further investigation needed?
+
+The answers depend on the loaded data, supported fields, logging coverage, and configured AI provider.
+
+## Testing and Benchmarking
+
+Run the test commands supported by the checked-out version.
+
+For a repository configured with pytest:
 
 ```powershell
-python LogAsis.py
+python -m pytest
 ```
 
-The repository intentionally does **not** include the project's virtual environment or internal regression-test suite.
+Before relying on benchmark results, verify that the evaluation runs against the real ingestion, indexing, retrieval, and AI Analyst pipeline.
 
-## First use
+A useful evaluation suite should include:
 
-1. Start LogAsis with `python LogAsis.py`.
-2. Load a supported security log using the application.
-3. Review the detected log profile and normalized events.
-4. Use the Events tab to inspect and filter records.
-5. Select a filter field and choose one of the values discovered from the loaded log; manual value entry is not required for normal field/value filtering.
-6. Configure a live AI provider from the AI configuration interface if AI investigation is required.
-7. Ask questions about the currently loaded log in the AI Analyst.
-8. Review the answer together with its evidence references and qualification/grounding information.
+- Exact-count questions.
+- Entity and time-range queries.
+- Multi-event correlation.
+- Large-log and multi-chunk investigations.
+- Contradictory evidence.
+- False premises and insufficient-evidence questions.
+- Citation validity and claim grounding.
+- Parser errors and malformed records.
 
-The Events filter does not silently restrict the AI investigation: AI analysis operates on the full loaded log rather than only the currently filtered Events view.
+Keep reference answers separate from the model's input during scored evaluations. Report measured accuracy, coverage, failures, and limitations rather than assumed performance.
 
-## Project structure
+## Project Structure
+
+The source tree may vary between releases. Major architectural areas have included:
 
 ```text
 LogAsis/
-├── ai/                     # AI providers, investigation runtime, retrieval, grounding
-├── core/                   # Evidence, cases, correlation, analysis, investigation state
-├── gui/                    # PySide6 desktop interface
-├── parsers/                # Log-format parsers
-├── config/                 # Safe configuration templates
-├── assets/                 # Application assets
-├── data/                   # Local generated/user data; not committed
-├── exports/                # Generated exports; not committed
-├── runtime/                # Local runtime logs; not committed
-├── docs/                   # Current architecture/provider/filter documentation
-├── LogAsis.py              # Application entry point
-├── requirements.txt        # Python dependencies
-├── README.md
-├── CHANGELOG.md
-├── VERSION
-└── VERSION.txt
+â”œâ”€â”€ ai/             # AI Analyst, investigation and provider components
+â”œâ”€â”€ core/           # Event models, indexing, queries and correlation
+â”œâ”€â”€ gui/            # Graphical user interface
+â”œâ”€â”€ docs/           # Architecture and technical documentation
+â”œâ”€â”€ tests/          # Automated tests, when included
+â”œâ”€â”€ requirements.txt
+â””â”€â”€ README.md
 ```
 
-## Security and privacy
+Consult the actual repository for the complete and current structure.
 
-LogAsis is intended for security-log investigation, and logs may contain sensitive information such as usernames, IP addresses, hostnames, commands, paths, or other forensic data.
+## Security and Privacy
 
-Do not commit:
+- Treat logs as potentially sensitive because they may contain usernames, IP addresses, hostnames, tokens, URLs, or personal information.
+- Do not upload confidential logs to external AI providers unless authorized by your organization's policies.
+- Never commit API keys, credentials, private configuration files, or sensitive datasets.
+- Treat instructions embedded in log messages as untrusted data.
+- Use synthetic or sanitized logs for public demonstrations.
+- Review dependencies and downloaded release artifacts before execution.
 
-- Real investigation logs
-- Personal or organizational log data
-- API keys or provider credentials
-- `.env` files
-- Generated case/evidence data
-- Runtime logs
-- Exported investigation artifacts
+## Known Limitations
 
-The repository is configured to ignore common local secrets, runtime state, generated data, logs, caches, virtual environments, and forensic artifacts.
+- Supported log formats depend on the implemented parsers.
+- Missing source logs can prevent a definitive conclusion.
+- AI-generated analysis may contain errors and requires evidence-based verification.
+- Provider availability, latency, and model behavior vary by configuration.
+- Large datasets require appropriate indexing, retrieval, and coverage checks.
+- Planned features should not be considered implemented until verified in the source and tests.
 
-No real investigation dataset is included in this release. Development/test sample logs have been intentionally excluded from the public repository.
+Document release-specific limitations and any known defects in the v0.10.0 release notes.
 
-## AI grounding and limitations
+## Contributing
 
-LogAsis uses AI for investigation and interpretation, but provider output is not automatically considered forensic fact.
+Contributions are welcome through issues and pull requests.
 
-The grounding layer checks claims against evidence references and preserves distinctions such as:
+1. Fork the repository or create a feature branch.
+2. Make a focused change.
+3. Add or update tests.
+4. Run the relevant test suite.
+5. Document configuration or compatibility changes.
+6. Submit a pull request describing the change and its validation results.
 
-- observed event vs. inferred activity
-- successful authentication vs. proven account compromise
-- file download/execution vs. proven attacker access
-- observed artifact vs. proven malware classification
+Avoid committing temporary files, build output, virtual environments, secrets, or private logs.
 
-This is intended to reduce unsupported conclusions, but LogAsis should still be used as an investigation aid and not as a replacement for analyst judgment.
+## Version
 
-## Documentation
+**Current release target: v0.10.0**
 
-Current project documentation is available in `docs/`:
+- Repository: https://github.com/TechParthOps/LogAsis
+- Default branch: `main`
+- Release tag: `v0.10.0`
 
-- `docs/ARCHITECTURE.md` — investigation pipeline and evidence boundary
-- `docs/AI-PROVIDER-COMPATIBILITY.md` — live AI provider behavior and grounding
-- `docs/DYNAMIC_EVENT_FILTERS.md` — event filtering behavior
-
-See `CHANGELOG.md` for release history.
-
-## Development
-
-The public repository intentionally excludes the internal regression-test suite and development fixtures.
-
-For local development, create your own virtual environment and install dependencies from `requirements.txt`.
+Ensure that the source version, changelog, README, release tag, and published binaries agree before publishing.
 
 ## License
 
-LogAsis is released under the **MIT License**. See [`LICENSE`](LICENSE) for the full license text.
-
----
-
-**LogAsis v0.9.7**
+See the repository's `LICENSE` file for the applicable license. If no license has been selected, add one before claiming that the project is released under a specific open-source license.

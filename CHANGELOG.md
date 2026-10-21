@@ -1,5 +1,177 @@
 # Changelog
 
+## 0.10.0 — Multi-format log support and dynamic suggested questions
+
+- **Any log type now gets correct answers.** The deterministic incident
+  profiler is format-aware: the same intrusion grammar (authentication
+  anomalies → attacker session → tooling → escalation → sensitive access) is
+  recognized on Linux auditd/syslog evidence (sudo/sudoedit, /etc/shadow)
+  AND on Windows evidence — 4625/4624/4648/4776 logon events (EVTX-to-JSON
+  and Sysmon exports), encoded/hidden PowerShell, credential dumpers
+  (mimikatz-style), LSASS access (Sysmon EventID 10) and dump/hive staging
+  (EventID 11), certutil/bitsadmin/Invoke-WebRequest downloads, remote-exec
+  tooling (psexec/wmic/winrs), persistence via scheduled tasks/registry run
+  keys, account manipulation, and anti-forensics (shadow-copy deletion,
+  event-log clearing).
+- **Windows event-ID normalization**: the JSON parser now maps Windows
+  Security event IDs to actions (4625 → failed_login, 4624/4648/4776 →
+  successful_login, 4688/Sysmon 1 → process_create), so Windows brute-force
+  and logon sequences are detected without any status text.
+- **Dynamic suggested questions**: the AI Analyst's suggested-question
+  buttons are now derived from the LOADED log (log type, available fields,
+  incident profile) instead of a fixed auditd-oriented list. Windows/Sysmon
+  logs get suspicious-process/credential-access/artifact questions; SSH/auth
+  logs keep the compromise/CVE/root questions; web logs get error/route
+  questions; firewall and DNS logs get traffic questions. The grid refreshes
+  automatically on every log load.
+- Suspicious-content-only captures (pure Sysmon, no authentication events)
+  now produce deterministic summaries and suspicious-execution answers
+  instead of falling through unanswered.
+- Question understanding fixed: "What files did the attacker access?"
+  no longer mis-routes to the attacker-IP conclusion; bare "attacker"
+  mentions are treated as context when the question asks for a different
+  value kind.
+- 121 tests pass (26 incident-profile tests now cover Windows, Sysmon-only,
+  and web-log suggestions).
+
+## 0.9.9 — Deterministic incident profiler, correct incident answers
+
+- New **deterministic incident profiler** (`core/incident_profile.py`): from
+  any loaded log it derives the evidence-backed intrusion facts with no model
+  involvement — compromised account and attacker source from the
+  failed-then-successful login signature (ordered by row position, since
+  real auditd captures are frequently timestamped within the same second),
+  the attacker session scope, escalation executions, the resulting root
+  shell, downloaded tooling/payloads, and root sensitive-file reads.
+- The AI Analyst's deterministic layer now answers the incident questions
+  **correctly on a real 83k-row auditd capture** (SSH brute force → linpeas
+  → sudoedit exploit → root shell → /etc/shadow): "Which account was
+  compromised?" names the brute-forced account with counts, "What
+  attack type...?" reports brute force, "What is the attacker's IP?" names
+  the source, "What file was exfiltrated once root was gained?" reports the
+  root read of /etc/shadow, "What is the binary and PID used to gain
+  root?" reports the sudoedit exploit execution and the uid=0 payload shell,
+  "What tool was used to perform system enumeration?" identifies linpeas
+  from the attacker-controlled URL, and "Summarize highest-risk findings" /
+  "Explain critical activity" produce a deterministic numbered summary with
+  an evidence chain.
+- **Execution-based exploit signatures**: CVE mapping (CVE-2021-3156
+  "Baron Samedit", CVE-2021-4034 PwnKit, CVE-2022-0847 Dirty Pipe) fires
+  only when the exploit utility is actually executed. Enumeration-scanner
+  privilege-boundary checks (`sudo -l`, `sudo -V`, `sudo -S -l`,
+  `pkexec --version`) are flagged as checks and never presented as
+  escalation or exploit evidence.
+- Privilege-goal phrasing fixed: "gain root" / "root access" / "root was
+  gained" no longer resolve as a `username=root` filter that silently
+  narrowed answers to root's own records.
+- The agentic AI investigation runtime is seeded with the incident profile
+  facts and their evidence rows, so Live AI answers start from the same
+  verified forensic context instead of re-deriving (or hallucinating) it.
+- 112 tests pass (17 new incident-profile regression tests).
+
+## 0.9.8.2 — Evidence-backed direct answers, provider failure resilience
+
+- Conclusion questions now compute the **actual best-supported answer from
+  the log** instead of a generic refusal: "Which account was compromised?"
+  identifies the account with the failed-then-successful login sequence
+  (with counts and source IPs), "What is the attacker's IP?" names the
+  source with that signature, "What attack type was used to gain initial
+  access?" reports the observed pattern (brute-force interpretation with its
+  counts), and "What file was exfiltrated...?" lists the files/URLs that
+  actually appear in transfer commands. Security labels stay qualified
+  (evidence-backed interpretation, not asserted as proven).
+- "What tool was used to..." questions now extract executed command tokens
+  ranked by frequency instead of listing every daemon process.
+- Evidence chains now point at the events that matter (the login-sequence
+  and transfer-command records) rather than the first rows of the dataset,
+  and whole-dataset identity dumps are capped.
+- Fixed "AI ANALYSIS FAILED — no analyst text (finish_reason=length)":
+  when a reasoning-style model exhausts the completion budget with hidden
+  reasoning, the request is retried with a larger budget (up to 8192) before
+  failing, and each planner step retries once with the normal budget.
+- Verified end-to-end against a realistic auditd-style scenario (brute-force
+  SSH then success then root commands): all five suggested questions produce
+  distinct, evidence-backed answers. 95 tests pass; all benchmark release
+  gates hold.
+
+## 0.9.8.1 — Direct answers, per-question specificity, responsive UI, live model catalog
+
+- AI Analyst now gives a **DIRECT ANSWER** first. When the actual answer is
+  found in the loaded log (a count, an identified binary/PID/CVE/file/user,
+  or a verified zero), the answer is short and no evidence listing is shown.
+  An **EVIDENCE CHAIN** section appears only when no direct answer is
+  available (abstentions, verified zeros, ambiguity); full grounding stays in
+  the collapsible grounding panel.
+- "What/which" questions are now answered as **extractions**, not generic
+  event counts: "What CVE was exploited to gain root access?" reports the CVE
+  identifiers present (or states none are recorded), "What is the binary and
+  PID used to gain root?" reports observed process names and PIDs, and
+  conclusion-shaped questions ("which account was compromised?", "what is
+  the attacker's IP?") receive qualified direct answers that report what the
+  log actually shows without asserting unproven security labels. Different
+  questions no longer return the same generic answer.
+- Remaining "Not responding" freezes fixed for large logs (100k+ events):
+  investigation/operations/dashboard refreshes no longer run IOC extraction,
+  detection engines, or report builders on the GUI thread (results come from
+  the background analysis worker), and the Analyze button no longer copies
+  the whole DataFrame on the GUI thread.
+- AI analysis is faster: investigation budget reduced to 3 planning steps /
+  6 tool calls, planner round-trips use a compact context and a bounded
+  completion budget, a deterministic head start records authoritative counts
+  before any planner call (often removing tool calls entirely), and the
+  evidence catalog is warmed during upload in the background.
+- Model selection is now fully dynamic: the config dialog fetches the
+  provider's live model catalog on a background thread, shows only currently
+  offered chat models (embeddings/rerankers/safety models filtered out), and
+  automatically drops models the provider has removed — with a clear notice
+  and a same-family replacement when a saved model was retired.
+- Release gates re-verified after the changes: exact-count accuracy 1.0,
+  citation validity 1.0, zero unsupported abstention assertions, evidence
+  recall 1.0; test suite grown to 94 tests, all passing.
+
+## 0.9.8 — Deterministic factual accuracy, evidence grounding hardening, benchmark tooling
+
+- Added a deterministic factual answer layer (`core/question_understanding.py`,
+  `core/deterministic_qa.py`): arbitrary count/list/timeline questions are
+  answered by validated indexed queries over the complete dataset — no
+  provider call and no model arithmetic. Prove/cause questions receive
+  abstention scaffolds that refuse unsupported compromise, exfiltration,
+  exploitation, and causation conclusions.
+- Fixed `EventIndex.intersect` returning ALL rows when every condition set
+  was empty (AND queries with one non-matching filter counted the wrong
+  population).
+- Fixed `QueryEngine` counts being corrupted by result limits (`count` now
+  always reports the complete matching set; `returned_count`/`truncated`
+  describe the bounded sample).
+- Query plans now fail closed: unknown fields, unsupported operators, and
+  bare field/value mappings no longer silently widen into "match everything".
+- Timestamp handling hardened: malformed/mixed-format timestamps no longer
+  crash ingestion; parse failures are flagged per record; timestamps
+  normalize to UTC for sort/comparison safety.
+- Investigation runtime gained a deterministic `count_events` tool, coverage
+  accounting (`total_events` … `completion_reason`), and explicit completion
+  status (`COMPLETED_SUFFICIENT`, `COMPLETED_INSUFFICIENT`, `PARTIAL`,
+  `FAILED`); exhausting the tool budget is never reported as "completed".
+- Claim grounding now verifies set-level counts against deterministic
+  full-dataset query results (true counts beyond the evidence-bundle sample
+  are accepted; contradicted counts are rejected), adds a causal-support gap
+  (temporal proximity alone is insufficient), and adds a distinct HYPOTHESIS
+  claim class.
+- Rewrote `core/claim_verification.py` classification: claims are verified
+  against actual record content instead of certainty keywords such as "is".
+- Uploads now parse and index on a background thread (`IngestionWorker`);
+  the window no longer shows "Not responding" while loading large logs.
+- AI Analyst session context resolves contextual references ("this source")
+  from earlier questions in the same session.
+- Added the `training/` package (prepare / benchmark / evaluate /
+  generate_questions / finetune_export) and an 83-test regression suite
+  (`tests/`); all four release gates pass on the synthetic benchmark
+  (exact-count accuracy 1.0, citation validity 1.0, zero unsupported
+  abstention assertions, evidence recall 1.0). See
+  `docs/ACCURACY_IMPROVEMENTS.md`.
+- Added Windows packaging: PyInstaller spec + Inno Setup script
+  (`packaging/build_setup_exe.ps1`) producing the LogAsis setup exe.
+
 ## 0.9.7 — Stable AI answers across installs and runs
 
 - Diagnosed why the installed app and `LogAsis.py` could answer the same

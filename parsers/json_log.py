@@ -174,12 +174,33 @@ def _event_type(flat: dict[str, Any]) -> str:
     return provider or "json"
 
 
+# Windows Security event IDs with a fixed success/failure meaning. Used when
+# the record carries no explicit status text (EVTX-to-JSON exports usually
+# don't): 4625 failed logon, 4624 successful logon, 4648 explicit-credential
+# logon, 4776 credential validation.
+_WINDOWS_FAILED_EVENT_IDS = {"4625"}
+_WINDOWS_SUCCESS_EVENT_IDS = {"4624", "4648", "4776"}
+_WINDOWS_PROCESS_EVENT_IDS = {"4688", "1"}  # 4688 CommandLine audit, Sysmon 1 ProcessCreate
+
+
 def _action(flat: dict[str, Any], event_type: str) -> str:
     explicit = _find_value(flat, ALIASES["action"]).lower()
     if explicit in {"failed", "failure", "fail", "denied", "blocked"}:
         return "failed"
     if explicit in {"success", "successful", "allowed", "accepted"}:
         return "success"
+    # Windows logon/audit event IDs carry a fixed meaning even without any
+    # status text. Only applied when no explicit action already matched.
+    event_id = _find_value(flat, ALIASES["event_id"]).strip()
+    if event_id:
+        if event_id in _WINDOWS_FAILED_EVENT_IDS or event_id == "4776" and str(
+            _find_value(flat, ("Status", "SubStatus"))
+        ).upper() not in {"", "0X0"}:
+            return "failed_login"
+        if event_id in _WINDOWS_SUCCESS_EVENT_IDS:
+            return "successful_login"
+        if event_id in _WINDOWS_PROCESS_EVENT_IDS:
+            return "process_create"
     text = " ".join(str(v) for v in flat.values()).lower()
     if any(x in text for x in ("failed password", "authentication failure", "logon failure", "access denied")):
         return "failed_login"

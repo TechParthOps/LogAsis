@@ -40,6 +40,14 @@ class ClaimVerifier:
         self.index = index
 
     def verify_claim(self, text: str, evidence_ids: list[str]) -> Claim:
+        """Verify a claim against the actual content of its cited records.
+
+        Classification is derived from what the cited records contain, not
+        from the sentence's confidence vocabulary. The previous implementation
+        used substring checks such as ``"is" in text`` (which also matches
+        "this"/"analysis") and promoted virtually any multi-event claim to a
+        HIGH-confidence VERIFIED_FACT regardless of support.
+        """
         claim = Claim(text=text, evidence_ids=list(evidence_ids))
 
         if not evidence_ids:
@@ -64,25 +72,87 @@ class ClaimVerifier:
 
         text_lower = text.lower()
         has_interpretation_language = any(
-            word in text_lower
+            re.search(rf"\b{re.escape(word)}\b", text_lower)
             for word in ("likely", "possibly", "suggests", "consistent with", "may have", "could be", "appears to", "warrants")
         )
-        has_certainty_language = any(
-            word in text_lower
-            for word in ("is", "was", "were", "confirmed", "established", "observed", "found")
-        )
+        # Negation-aware: "does not establish compromise" must not read as
+        # certainty language ("established") supporting a positive fact.
+        negated = bool(re.search(
+            r"\b(?:does\s+not|do\s+not|not\s+establish|cannot|no\s+evidence|unproven|unconfirmed)\b",
+            text_lower,
+        ))
 
-        if has_interpretation_language and not has_certainty_language:
+        # Direct support: concrete terms in the claim must appear in the
+        # cited records. High-signal tokens only (identifiers, ports, paths,
+        # process names, explicit field values) — ordinary English words and
+        # security adjectives carry no evidentiary weight.
+        claim_terms = self._concrete_terms(text)
+        unsupported_terms: list[str] = []
+        for term in claim_terms:
+            if not any(term in str(event).lower() for event in events):
+                unsupported_terms.append(term)
+        if unsupported_terms:
+            claim.contradiction = False
+            claim.claim_type = self.UNSUPPORTED
+            claim.support_status = "CONCRETE_TERMS_NOT_IN_EVIDENCE"
+            claim.confidence = "LOW"
+            return claim
+
+        # Conclusion-like security assertions require corroboration beyond a
+        # matching record; failed/successful log lines never prove compromise,
+        # exfiltration, exploitation, or causation on their own.
+        unsupported_conclusion = self._unsupported_conclusion(text_lower, events)
+        if unsupported_conclusion:
+            claim.claim_type = self.UNSUPPORTED
+            claim.support_status = unsupported_conclusion
+            claim.confidence = "LOW"
+            return claim
+
+        if has_interpretation_language or negated:
             claim.claim_type = self.GROUNDED_INTERPRETATION
             claim.confidence = "MODERATE"
-        elif has_certainty_language:
+        elif claim_terms:
+            # Concrete, evidence-matched statement without interpretation
+            # language: a verified observation of what the records contain.
             claim.claim_type = self.VERIFIED_FACT
-            claim.confidence = "HIGH" if len(events) >= 2 else "MODERATE"
+            claim.confidence = "HIGH"
         else:
+            # No concrete anchors at all: the sentence cannot be verified as
+            # a fact merely because citations exist.
             claim.claim_type = self.GROUNDED_INTERPRETATION
             claim.confidence = "LOW"
 
         return claim
+
+    @staticmethod
+    def _concrete_terms(text: str) -> set[str]:
+        terms: set[str] = set()
+        for match in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text):
+            terms.add(match.lower())
+        for match in re.findall(r"\b[\w.\-]+\.(?:exe|dll|sh|py|bat|ps1|bin)\b", text, re.I):
+            terms.add(match.lower())
+        for match in re.findall(r"\bCVE-\d{4}-\d{4,8}\b", text, re.I):
+            terms.add(match.lower())
+        for match in re.findall(r"(?<![\w])(?:[A-Za-z]:\\[^\s,;\"]+|/[\w.@:+~-]+(?:/[^\s,;\"]+)*)", text):
+            terms.add(match.lower().rstrip(".,;:)"))
+        for match in re.findall(r"\b(?:user|username|account|process|host|port|domain)\s*[=:]\s*([\w.\-@]+)", text, re.I):
+            terms.add(match.lower().rstrip(".,;:)"))
+        return {t for t in terms if len(t) >= 3}
+
+    @staticmethod
+    def _unsupported_conclusion(text_lower: str, events: list[dict[str, Any]]) -> str | None:
+        joined = " ".join(str(event) for event in events).lower()
+        checks = [
+            (r"\b(?:compromis(?:e|ed)|breach(?:ed)?)\b", r"\bcompromis(?:e|ed)\b", "compromise"),
+            (r"\bexfiltrat(?:e|ed|ion)\b", r"\bexfiltrat(?:e|ed|ion)\b", "exfiltration"),
+            (r"\bexploit(?:ed|ation)?\b", r"\bexploit(?:ed|ation)\b", "exploitation"),
+            (r"\bmalware\b|\bbackdoor\b", r"\bmalware\b|\bbackdoor\b", "malware"),
+            (r"\bcaus(?:e|ed|es)\b", r"\bcaus(?:e|ed|es)\b", "causation"),
+        ]
+        for conclusion_re, corroboration_re, label in checks:
+            if re.search(conclusion_re, text_lower) and not re.search(corroboration_re, joined):
+                return f"CONCLUSION_NOT_CORROBORATED: {label}"
+        return None
 
     def verify_answer(self, answer_text: str, evidence_ids: list[str]) -> dict[str, Any]:
         claims = self._extract_claims(answer_text)

@@ -247,6 +247,7 @@ class BaseAIProvider:
     supports_agentic_investigation = False
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
+        """Abstract generate; concrete providers may accept ``max_tokens``."""
         raise NotImplementedError
 
     def generate_large(self, system_prompt: str, user_prompt: str, source_file: str) -> str:
@@ -547,7 +548,16 @@ class OpenAIProvider(BaseAIProvider):
         if not self.api_key:
             raise AIProviderError("OPENAI_API_KEY is not configured. Use Live AI → Configure instead.")
         return _openai_compatible_generate(
-            self.base_url, self.model, self.api_key, system_prompt, user_prompt
+            self.base_url, self.model, self.api_key, system_prompt, user_prompt,
+            max_tokens=getattr(self, "_pending_max_tokens", None),
+        )
+
+    def generate_with_options(self, system_prompt: str, user_prompt: str, *, max_tokens: int | None = None) -> str:
+        """Generate with an explicit completion budget (used by bounded
+        planner calls; ignored by providers that do not support the option)."""
+        return _openai_compatible_generate(
+            self.base_url, self.model, self.api_key, system_prompt, user_prompt,
+            max_tokens=max_tokens,
         )
 
 
@@ -651,7 +661,7 @@ class NvidiaNIMProvider(BaseAIProvider):
         )
         self.base_url = (config.base_url or "https://integrate.api.nvidia.com/v1").rstrip("/")
 
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
+    def generate(self, system_prompt: str, user_prompt: str, *, max_tokens: int | None = None) -> str:
         system_prompt = "/no_think\n" + system_prompt
         # Always calculate the NIM budget. Small prompts retain the normal
         # 4096-token completion; large prompts are reduced to the remaining
@@ -659,6 +669,8 @@ class NvidiaNIMProvider(BaseAIProvider):
         output_budget = _nim_output_budget(
             system_prompt, user_prompt, requested_output_tokens=4096,
         )
+        if max_tokens is not None:
+            output_budget = min(output_budget, int(max_tokens))
         # Preserve the legacy adapter call contract (512 for an ordinary
         # request); _openai_compatible_generate expands that compatibility
         # value to the real NIM payload budget of 4096. Near the context limit,
@@ -694,9 +706,10 @@ class LiveAIProvider(BaseAIProvider):
     def list_models(self) -> list[AIModelInfo]:
         return list_live_models(self.config, self.api_key)
 
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
+    def generate(self, system_prompt: str, user_prompt: str, *, max_tokens: int | None = None) -> str:
         deterministic_temperature = None
-        if self.provider.strip().lower() == "nvidia nim":
+        nim = self.provider.strip().lower() == "nvidia nim"
+        if nim:
             # Nemotron supports an explicit reasoning-off switch. Keeping the
             # analyst request focused prevents hidden reasoning from consuming
             # the evidence/context budget and makes structured output reliable.
@@ -707,12 +720,14 @@ class LiveAIProvider(BaseAIProvider):
             # for provider-side tokenization overhead.
             prompt_tokens = max(1, (len(system_prompt) + len(user_prompt) + 3) // 4)
             output_budget = _nim_output_budget(prompt_tokens)
+            if max_tokens is not None:
+                output_budget = min(output_budget, int(max_tokens))
             # LogAsis runs Nemotron in reasoning-OFF mode. Use greedy decoding
             # for repeatable analyst output; NVIDIA recommends greedy decoding
             # for reasoning-OFF use of this model.
             deterministic_temperature = 0.0
         else:
-            output_budget = 4096
+            output_budget = int(max_tokens) if max_tokens is not None else 4096
         try:
             return _openai_compatible_generate(
                 self.base_url, self.model, self.api_key, system_prompt, user_prompt,
@@ -768,54 +783,78 @@ def _openai_compatible_generate(base_url: str, model: str, api_key: str,
         # sending the current NIM payload with its normal 4096-token budget.
         if "nvidia/" in str(model).lower() and effective_max_tokens == 512:
             effective_max_tokens = 4096
-        payload["max_tokens"] = effective_max_tokens
+    else:
+        effective_max_tokens = 4096
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     if "nvidia/" in str(model).lower() and float(temperature) <= 0.0:
         # Greedy decoding plus a fixed seed keeps repeated analyst calls as
         # reproducible as the hosted model allows. Endpoints that reject the
         # OpenAI seed field fall back to a seedless request below.
         payload["seed"] = _NIM_DETERMINISTIC_SEED
+
+    def _request(with_seed: bool, budget: int):
+        body = dict(payload)
+        body["max_tokens"] = int(budget)
+        if not with_seed:
+            body.pop("seed", None)
+        return _post_json(f"{base_url}/chat/completions", body, headers)
+
+    def _parse(result):
+        try:
+            choice = result["choices"][0]
+            message = choice.get("message") or {}
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    str(x.get("text", "")) if isinstance(x, dict) else str(x)
+                    for x in content
+                )
+            content = str(content or "").strip()
+
+            # Some OpenAI-compatible gateways/model revisions expose text in a
+            # nested content part rather than a plain string. Recover only actual
+            # answer text here; never surface hidden/reasoning fields as analyst
+            # output.
+            if not content and isinstance(choice.get("text"), str):
+                content = choice["text"].strip()
+            if not content and isinstance(message.get("content"), dict):
+                content = str(message["content"].get("text", "")).strip()
+            return content, str(choice.get("finish_reason") or "unknown")
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AIProviderError("Unexpected live AI response format.") from exc
+
+    result = None
     try:
-        result = _post_json(f"{base_url}/chat/completions", payload, headers)
+        result = _request(True, effective_max_tokens)
     except AIProviderError as exc:
         if (
-            payload.pop("seed", None) is not None
+            "seed" in payload
             and getattr(exc, "status_code", None) == 400
             and "seed" in str(exc).lower()
         ):
-            result = _post_json(f"{base_url}/chat/completions", payload, headers)
+            result = _request(False, effective_max_tokens)
         else:
             raise
-    try:
-        choice = result["choices"][0]
-        message = choice.get("message") or {}
-        content = message.get("content")
-        if isinstance(content, list):
-            content = "".join(
-                str(x.get("text", "")) if isinstance(x, dict) else str(x)
-                for x in content
-            )
-        content = str(content or "").strip()
 
-        # Some OpenAI-compatible gateways/model revisions expose text in a
-        # nested content part rather than a plain string. Recover only actual
-        # answer text here; never surface hidden/reasoning fields as analyst
-        # output.
-        if not content and isinstance(choice.get("text"), str):
-            content = choice["text"].strip()
-        if not content and isinstance(message.get("content"), dict):
-            content = str(message["content"].get("text", "")).strip()
+    content, finish_reason = _parse(result)
+    # Reasoning-style models can consume the whole completion budget on hidden
+    # reasoning and return empty content with finish_reason=length (this
+    # previously failed the entire analysis). Retry with a larger budget
+    # before giving up.
+    if not content and finish_reason == "length" and effective_max_tokens < 8192:
+        retry_budget = min(8192, max(4096, effective_max_tokens * 4))
+        try:
+            result = _request("seed" in payload, retry_budget)
+        except AIProviderError:
+            result = None
+        if result is not None:
+            content, finish_reason = _parse(result)
 
-        if not content:
-            finish_reason = str(choice.get("finish_reason") or "unknown")
-            raise AIProviderError(
-                f"The live AI provider returned no analyst text (finish_reason={finish_reason})."
-            )
-        return content
-    except AIProviderError:
-        raise
-    except (KeyError, IndexError, TypeError) as exc:
-        raise AIProviderError("Unexpected live AI response format.") from exc
+    if not content:
+        raise AIProviderError(
+            f"The live AI provider returned no analyst text (finish_reason={finish_reason})."
+        )
+    return content
 
 
 def get_provider(name: str) -> BaseAIProvider:

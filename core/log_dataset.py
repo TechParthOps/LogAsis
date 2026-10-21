@@ -25,6 +25,32 @@ from core.analytics import events_to_dataframe, summary
 from core.integrity import build_evidence_manifest
 
 
+def safe_frame_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Convert a frame to plain records without crashing on datetime/NA dtypes.
+
+    ``df.fillna("")`` raises on datetime columns containing NaT and on
+    nullable integer columns, so any caller that serializes the loaded frame
+    must use this helper instead. Datetime values become ISO-8601 strings;
+    other missing values become "".
+    """
+    if df is None or len(df) == 0:
+        return []
+    safe = df.copy()
+    for col in safe.columns:
+        series = safe[col]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            safe[col] = series.dt.strftime("%Y-%m-%dT%H:%M:%S%z").fillna("")
+        else:
+            try:
+                safe[col] = series.fillna("")
+            except (TypeError, ValueError):
+                try:
+                    safe[col] = series.astype(str)
+                except Exception:
+                    safe[col] = series
+    return safe.to_dict("records")
+
+
 class LogDataset:
     """Persistent indexed representation of one loaded log file.
 
@@ -40,7 +66,7 @@ class LogDataset:
         self.df = df
         self.source_file = str(source_file or "")
         self.dataset_id = dataset_id or self._compute_dataset_id(df, source_file)
-        self.event_index = EventIndex(df.fillna("").to_dict("records"))
+        self.event_index = EventIndex(self._index_records(df))
         self.query_engine = QueryEngine(self.event_index)
         self.aggregation_engine = AggregationEngine(self.event_index)
         self._analytics_cache: dict[str, Any] = {}
@@ -48,7 +74,31 @@ class LogDataset:
         self._tool_catalog: dict[str, Any] | None = None
         self._content_hash: str | None = None
         self._evidence_manifest = None
+        self._incident_profile: Any = None
         self._build_analytics_cache()
+
+    @staticmethod
+    def _index_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+        """Convert the frame to index records without crashing on datetimes.
+
+        ``df.fillna("")`` raises on datetime columns that contain NaT (the
+        value "" is incompatible with datetime64), so files with any
+        unparseable timestamp previously failed to build an index at all.
+        Datetime columns are serialized to ISO-8601 strings here instead.
+        """
+        if df is None or len(df) == 0:
+            return []
+        safe = df.copy()
+        for col in safe.columns:
+            series = safe[col]
+            if pd.api.types.is_datetime64_any_dtype(series):
+                safe[col] = series.dt.strftime("%Y-%m-%dT%H:%M:%S%z").fillna("")
+            else:
+                try:
+                    safe[col] = series.fillna("")
+                except (TypeError, ValueError):
+                    safe[col] = series.astype(str)
+        return safe.to_dict("records")
 
     @staticmethod
     def _compute_dataset_id(df: pd.DataFrame, source_file: str) -> str:
@@ -78,7 +128,7 @@ class LogDataset:
         try:
             self._evidence_manifest = build_evidence_manifest(
                 self.source_file,
-                self.df.fillna("").to_dict("records"),
+                self._index_records(self.df),
                 [],
             )
         except Exception:
@@ -128,6 +178,28 @@ class LogDataset:
             from ai.investigation_agent import build_tool_catalog
             self._tool_catalog = build_tool_catalog(self.df)
         return self._tool_catalog
+
+    def get_incident_profile(self):
+        """Deterministic incident profile, built once per uploaded log.
+
+        Derives the strongest evidence-backed incident facts (compromised
+        account, attacker source, escalation executions, exploit signature
+        matches, downloaded tools, root sensitive reads) with no model
+        involvement. Returns None when the log has no identifiable incident
+        or the profile build fails; a failed build is not retried.
+        """
+        if self._incident_profile is None:
+            from core.incident_profile import build_incident_profile
+            from core.question_understanding import QuestionSchema
+
+            try:
+                schema = QuestionSchema(self.event_index)
+                self._incident_profile = build_incident_profile(
+                    self.df, self.event_index, schema
+                ) or False
+            except Exception:
+                self._incident_profile = False
+        return self._incident_profile or None
 
     def query(self, plan: QueryPlan | dict[str, Any]) -> dict[str, Any]:
         return self.query_engine.execute(plan)

@@ -1,116 +1,79 @@
-# LogAsis Evaluation Framework
+# Evaluation and benchmarking
 
-## Metrics
+LogAsis is evaluated against the synthetic LogAsis AI Analyst Benchmark
+(`E:\LogAsis_AI_Analyst_Benchmark`): 7 NDJSON log files (14,999 events), 18
+reference questions with ground-truth answers, exact counts, filters, and
+`event_uid` evidence identifiers.
 
-### Question Answer Accuracy
-- Exact-match accuracy for factual questions
-- Claim-level scoring for analytical questions
+**Leakage rule:** the ground truth directory is the evaluator's answer key.
+It is never passed into the AI prompt, the retrieval corpus, or the query
+layer during scored runs. Predictions are written separately from ground
+truth.
 
-### Evidence Metrics
-- Evidence Recall@K
-- Evidence Precision@K
-- MRR (Mean Reciprocal Rank)
-- F1 Score
+## Workflow
 
-### Claim Metrics
-- Claim Grounding Accuracy
-- Unsupported Claim Rate
-- Citation Accuracy
+Run from the repository root. All commands use the production ingestion
+pipeline (parsers → events_to_dataframe → LogDataset).
 
-### System Metrics
-- Latency (retrieval, planning, provider, total)
-- Token Usage
-- Investigation Steps
-- Tool Calls
+```powershell
+# 1. Validate dataset hashes and ingest every file (verifies counts)
+python -m training.prepare --benchmark "E:\LogAsis_AI_Analyst_Benchmark" --output benchmarks/prepared_dataset.json
 
-## Benchmark Suite
+# 2. Run all questions through the AI Analyst (deterministic mode; no
+#    provider needed because factual questions are answered by the
+#    deterministic query engine). Add --provider to route analytical
+#    questions through the configured Live AI provider.
+python -m training.benchmark --benchmark "E:\LogAsis_AI_Analyst_Benchmark" --output benchmarks/predictions.json
 
-### Filter Tests
-- Exact field lookup
-- Multiple filters (AND, OR, NOT)
-- Empty results
-- High-cardinality fields
-- Long values
-- Custom fields
-- Case handling
-- Numeric fields
-- Timestamps
-- Stale request cancellation
+# 3. Score the predictions against ground truth (separate step; the only
+#    component that reads the answer key)
+python -m training.evaluate --benchmark "E:\LogAsis_AI_Analyst_Benchmark" --predictions benchmarks/predictions.json --output benchmarks/results.json
 
-### AI Tests
-- Arbitrary question
-- Known question
-- Paraphrased question
-- Unseen question
-- Unknown field
-- Multi-event question
-- Timeline question
-- Contradiction question
-- Insufficient evidence
-- Provider failure
-- Malformed provider response
+# 4. Optional: generate extra schema-derived regression questions
+python -m training.generate_questions --benchmark "E:\LogAsis_AI_Analyst_Benchmark" --output benchmarks/generated_questions.jsonl
 
-### Grounding Tests
-- Unsupported claim rejection
-- Valid claim acceptance
-- Multiple evidence IDs
-- Contradiction detection
-- False premise handling
-
-### RAG Tests
-- Index built once
-- Reused across questions
-- Cache invalidation
-- Exact identifier retrieval
-- Lexical retrieval
-- Semantic retrieval
-
-## Evaluation Commands
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Run performance benchmarks
-python -m benchmarks.benchmark_baseline
-python -m benchmarks.benchmark_optimized
-
-# Prepare a dataset and generate ground-truth questions
-python -m training.prepare --dataset HDFS_v1
-python -m training.generate_questions --dataset HDFS_v1
-
-# Retrieval benchmark (no model/provider required):
-# Recall@K, MRR, precision, F1, latency of the index-backed retriever
-python -m training.benchmark --dataset HDFS_v1
-
-# Full model evaluation: run your model over questions.json to produce
-# predictions.json, then score answer accuracy, claim grounding,
-# citation accuracy, and system metrics
-python -m training.evaluate --predictions preds.json --ground-truth data/prepared/HDFS_v1/questions.json
+# 5. Optional: leakage-safe training example export (split by scenario group)
+python -m training.finetune_export --benchmark "E:\LogAsis_AI_Analyst_Benchmark" --output training_exports
 ```
 
-Metrics that cannot be computed from the supplied inputs are reported as
-`null` (never a misleading 0.0) - for example `question_answer_accuracy`
-when predictions contain only evidence IDs.
+## Metrics (reported separately, never aggregated into one score)
 
-## Split Methodology
+| Metric | Definition | Denominator |
+|---|---|---|
+| exact_count_accuracy | predicted count == expected count | questions with `expected_count` |
+| qa_accuracy | count match (factual) or refusal semantics (abstention) | all scored questions |
+| evidence_precision | |predicted ∩ expected| / |predicted| | questions with expected evidence |
+| evidence_recall | |predicted ∩ expected| / |expected| | questions with expected evidence |
+| citation_validity | every cited EVID id resolves in the loaded dataset | all answered questions |
+| unsupported_claim_rate | claims typed UNSUPPORTED/CONTRADICTED per question | questions with structured claims |
+| abstention_correct_rate | refusal present AND no asserted conclusion | abstention questions |
+| latency | median and p95 wall-clock per question | all questions |
+| provider_error_count | questions where the provider raised | all questions |
 
-- **Train**: 70% of examples
-- **Validation**: 15% of examples
-- **Test**: 15% of examples
+Undefined metrics (empty denominators) are reported as `null`, never as 0.
 
-Split by:
-- Dataset (no overlap between train/test datasets)
-- Scenario (no overlap between train/test scenarios)
-- Question formulation (different wordings in different splits)
+## Release gates (initial)
 
-`training.split_dataset(examples, group_key="type")` assigns whole groups
-to a single split so the same template/scenario never appears in two
-splits. `training.validate_dataset` verifies that split files are
-question-disjoint.
+- exact_count_accuracy ≥ 0.99 on deterministic count questions
+- citation validity = 1.0 (every emitted evidence reference exists)
+- zero unsupported assertions of compromise/exfiltration/exploitation/causation
+  in the explicit abstention cases
+- evidence recall ≥ 0.90 on questions with a fully specified expected evidence set
+- every answer discloses truncation/partial coverage when present
 
-## Leakage Prevention
+## Regression tests
 
-- Never evaluate on the same examples used for generation/tuning
-- Include completely unseen logs in the test set
-- A model that answers different wording of the same memorized log is not demonstrating generalization
+```powershell
+python -m pytest tests/ -v          # full suite (83 tests)
+python -m pytest tests/ -q          # quick run
+```
+
+Benchmark integration tests load the real corpus and are skipped
+automatically when the benchmark directory is not present.
+
+## Baseline comparison
+
+`training.evaluate --baseline <results.json>` compares the current metrics
+with a previously recorded run. Keep the evaluated predictions file immutable
+after scoring; never retune prompts or code against the scored test split
+without re-running everything afterwards.

@@ -10,13 +10,16 @@ The AI analyst uses the **same** indexed Log Intelligence Engine as the UI. Ther
 - AggregationEngine
 - EvidenceStore
 - CorrelationEngine
+- Question understanding + deterministic QA engine (`core/question_understanding.py`, `core/deterministic_qa.py`)
 
 ## Persistent session wiring
 
-One uploaded log creates one `LogDataset`. The GUI passes it into every AI
+One uploaded log creates one `LogDataset`. Uploads parse and index on a
+background thread (`IngestionWorker`), so the window never freezes ("Not
+responding") during ingestion. The GUI passes the dataset into every AI
 question (`AIWorker` -> `LogInvestigatorAgent.answer(..., dataset=...)` ->
 `AgenticInvestigationRuntime.run(..., dataset=...)`), which gives the
-investigation three shared, build-once resources:
+investigation shared, build-once resources:
 
 - `dataset.event_index` — evidence seeding and the read-only tools resolve
   candidates from the index instead of scanning the DataFrame per question.
@@ -26,81 +29,91 @@ investigation three shared, build-once resources:
   index is built once per dataset; passing a shared index prevents
   per-question rebuilds.
 
-Index-backed retrieval is verified for behavioral parity with the original
-scanning scorer by tests (`TestIndexBackedRetrieval`,
-`TestInvestigationToolLayerIndex` in `tests/test_ai.py`): same evidence IDs,
-same ordering, same scoring rules — only the execution strategy changed.
-
 If the shared index does not cover the same rows as the frame presented to
 the AI (for example after an unexpected mutation), the code falls back to the
 scanning path so evidence coverage is never reduced for speed.
 
+AI questions always analyze the **full loaded log**, never the Events-tab
+filtered view. Prior questions in the same session are passed as
+conversation context so contextual references ("this source") resolve the
+way an analyst would carry context — without ever introducing ground-truth
+information.
+
 ## Investigation Pipeline
 
 ```
-QUESTION
-    |
-    v
-Question Understanding (deterministic)
-    |
-    v
-Evidence Requirements
-    |
-    v
-Query Plan (LLM or deterministic)
-    |
-    v
-Query Engine (deterministic)
-    |
-    v
-Evidence (from index)
-    |
-    v
-Correlation (deterministic)
-    |
-    v
-Verification (deterministic)
-    |
-    +---- insufficient evidence ----> PLAN AGAIN
-    |
-    v
-LLM Synthesis
-    |
-    v
-Claim Verification
-    |
-    v
-Final Answer
+UPLOAD
+  -> PARSE (IngestionWorker, background thread)
+  -> NORMALIZE (events_to_dataframe, UTC dtype, parse-failure flags)
+  -> VALIDATE (counts vs manifest, identity mapping, stale-index checks)
+  -> INDEX ONCE (EventIndex)
+  -> QUESTION (arbitrary natural language)
+        |
+        v
+  QUESTION UNDERSTANDING (deterministic: entities, intent, time, proof/causality)
+        |
+        +------------------------------------------+
+        |                                          |
+   factual/abstention                       analytical
+        |                                          |
+        v                                          v
+  VALIDATED QUERY PLAN                    AGENTIC RUNTIME
+  (QueryEngine.compile;                   (bounded steps/tools,
+   fails closed on                          read-only tools incl.
+   unknown fields)                          count_events)
+        |                                          |
+        v                                          v
+  INDEXED EXECUTION                       DETERMINISTIC EVIDENCE
+  over the COMPLETE                       + deterministic counts
+  matching set                            + correlation/timeline
+        |                                          |
+        v                                          v
+  COVERAGE CHECK  <------------------------+
+        |
+        v
+  CLAIM VERIFICATION (claim_grounding; deterministic count corroboration)
+        |
+        v
+  FINAL VALIDATION (fabricated IDs rejected; counts cross-checked)
+        |
+        v
+  ANSWER + COVERAGE REPORT
 ```
 
 ## Fast Path vs Deep Path
 
-### Fast Factual Path
-For questions answerable with one or a few indexed operations:
+### Deterministic factual path
+For count/list/timeline questions and prove/cause (abstention) questions:
 
 ```
-Question -> Query -> Deterministic Result -> Verification -> Concise Answer
+Question -> understanding -> validated plan -> indexed query over the full
+dataset -> exact count / verified zero / refusal scaffold -> claims -> answer
 ```
 
-Example: "How many failed logins came from 10.0.0.5?"
-- No LLM call needed for counting
-- Deterministic result displayed immediately
+- No provider call and no model arithmetic: the number in the answer is the
+  query result over the complete matching set.
+- A question naming a concrete identifier that exists in no indexed field is
+  a **verified zero**, never "all other events".
+- Abstention scaffolds report what the evidence shows (per-entity
+  observations) and refuse unsupported conclusions (compromise, exfiltration,
+  successful exploitation, causation) explicitly.
 
-### Deep Investigation Path
-For questions involving why, how, attack chain, root cause, relationships:
+### Deep agentic path
+For questions needing interpretation:
 
 ```
- Planner -> Multiple Indexed Queries -> Correlation -> Timeline -> Evidence Verification -> LLM Synthesis
+Planner -> indexed tools (search/count/timeline/correlate/entity) -> evidence
+verification -> LLM synthesis -> claim grounding -> answer
 ```
 
-Providers with `supports_agentic_investigation` take this path for logs of any
-size — index-backed tools keep the planner's queries off the full DataFrame,
-so a large log does not reduce the answer to a bounded evidence sample.
-Providers without that capability fall back to a bounded single-shot
-evaluation for logs over 100 rows; see `AI-PROVIDER-COMPATIBILITY.md`.
-Tool results that hit their result limit report `total_matches`, so the
-planner and the answer's coverage accounting can see truncation instead of
-mistaking a partial result for the full match set.
+- The runtime has a `count_events` tool whose result is **authoritative**:
+  exact, exhaustive, never sampled. Deterministic counts are injected into
+  the synthesis prompt and into claim verification.
+- Providers with `supports_agentic_investigation` use this path for logs of
+  any size. Tool results that hit their limit report `total_matches`, so
+  truncation is visible to the planner and to coverage accounting.
+- Bounded steps/tool calls; the agent can never claim "completed" merely by
+  exhausting its budget (see completion status below).
 
 ## Query Planning
 
@@ -116,43 +129,75 @@ The LLM may produce a JSON query plan:
 }
 ```
 
-This is validated deterministically and compiled into index operations. The LLM never generates executable code.
+This is validated deterministically (`QueryEngine.compile`) and compiled into
+index operations. The LLM never generates executable code. Validation fails
+closed: unknown fields, unsupported operators, or unparseable time bounds
+produce an explicit error result, never a silently widened query. Bare
+field/value mappings are compiled as leaf conditions (an earlier defect
+compiled them as empty ANDs that matched every row).
 
 ## Claim Verification
 
 Every final answer is decomposed into claims:
 
-- **VERIFIED_FACT**: Directly supported by evidence
-- **GROUNDED_INTERPRETATION**: Qualified inference from evidence
-- **HYPOTHESIS**: Tentative explanation requiring more evidence
-- **UNSUPPORTED**: No evidence found
+- **VERIFIED_FACT**: directly supported by actual source records or by a
+  deterministic query result
+- **GROUNDED_INTERPRETATION**: qualified inference anchored to cited evidence
+- **HYPOTHESIS**: plausible explanation explicitly marked as not established
+- **RECOMMENDATION**: advisory actions, kept separate from findings
+- **INSUFFICIENT_CONTEXT**: observation whose security significance cannot be
+  determined from the evidence
+- **UNSUPPORTED_CLAIM / CONTRADICTED_CLAIM**: rejected; the reason is shown,
+  the claim text is not
 
-Only VERIFIED_FACT and appropriately qualified GROUNDED_INTERPRETATION appear in the final answer.
+Set-level counts are verified against **deterministic full-dataset query
+results** when available (the bounded evidence bundle alone cannot
+corroborate or refute a dataset-level count). A claim contradicting a
+deterministic count is rejected with the query result in the reason.
 
 ## Anti-Hallucination Rules
 
-- `successful_login` does NOT become `account compromised`
-- `file read` does NOT become `file exfiltrated`
-- `CVE-XXXX-XXXX appears` does NOT become `CVE was exploited`
-- `sudo` does NOT become `privilege escalation attack`
-- `suspicious command` does NOT become `malware`
+- `failed_login` / `successful_login` do NOT establish account compromise
+- `file read` does NOT establish exfiltration
+- `CVE appears` does NOT establish exploitation
+- `sudo` use does NOT establish privilege escalation
+- `suspicious command` does NOT establish malware
+- `blocked connection` does NOT establish successful communication
+- temporal proximity does NOT establish causation (causal claims require
+  shared session/process/correlation linkage evidence)
+- absence of matching events does NOT prove the event never occurred outside
+  the dataset or logging coverage
 
-## Coverage Accounting
+## Completion status and coverage accounting
+
+Investigation completion status (semantics):
+
+- `COMPLETED_SUFFICIENT` — finished with sufficient evidence for the objective
+- `COMPLETED_INSUFFICIENT` — finished, but the answer must disclose gaps
+- `PARTIAL` — stopped at the step/tool budget; findings cover part of the objective
+- `FAILED` — provider/parser/query/runtime error
+
+Exhausting the tool-call budget is PARTIAL, never "completed".
 
 Every answer tracks:
-- total_events
-- indexed_events
-- query candidate_events
-- retrieved_events
-- correlated_events
-- verified evidence
-- excluded events
-- coverage_status: COMPLETE, TARGETED, PARTIAL, UNKNOWN
+
+- total_events, indexed_events, candidate_events
+- total_matching_events, retrieved_events, correlated_events
+- verified_evidence, excluded_events
+- failed_batches, truncated_results
+- coverage_status: COMPLETE (exhaustive over the full dataset for the stated
+  filters), TARGETED (scoped question answered exhaustively within its
+  scope), PARTIAL, UNKNOWN
+- completion_reason
+
+Counts are never labelled exhaustive when they come from a truncated result.
 
 ## Provider Failure Handling
 
 If the AI provider fails:
-- Deterministic queries continue working
-- No infinite retries on rate limits
-- Malformed output: repair or retry once within strict budget
-- Provider unavailable: return deterministic evidence with message "AI synthesis unavailable; deterministic evidence analysis completed."
+- Deterministic queries and the deterministic factual path continue working
+- No infinite retries on rate limits (bounded retry with Retry-After)
+- Malformed output: bounded repair pass; a provider response with no usable
+  action fails the investigation explicitly (FAILED)
+- Provider unavailable: deterministic evidence is still returned; factual
+  questions need no provider at all

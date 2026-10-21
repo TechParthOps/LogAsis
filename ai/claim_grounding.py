@@ -29,6 +29,7 @@ from ai.evidence_grounding import (
 
 VERIFIED_FACT = "VERIFIED_FACT"
 GROUNDED_INTERPRETATION = "GROUNDED_INTERPRETATION"
+HYPOTHESIS = "HYPOTHESIS"
 RECOMMENDATION = "RECOMMENDATION"
 INSUFFICIENT_CONTEXT = "INSUFFICIENT_CONTEXT"
 UNSUPPORTED_CLAIM = "UNSUPPORTED_CLAIM"
@@ -250,11 +251,19 @@ def _unsupported_security_conclusion(claim: str, evidence_texts: list[str]) -> s
          re.compile(r"\b(?:uid|euid)=0\b|\bprivilege\s+boundary\s+(?:crossed|bypassed)\b|\bgained\s+(?:root|elevated)\s+(?:access|privileges)\b"),
          "privilege escalation is not established by the cited evidence"),
         (re.compile(r"\b(?:exfiltrat(?:e|ed|ion)|data\s+(?:leak|theft|stolen)|stole\s+(?:data|files))\b"),
-         re.compile(r"\b(?:upload|uploaded|outbound|transfer|transferred|scp|sftp|rsync|curl|wget|put|stor)\b"),
+         re.compile(r"\b(?:upload(?:ed)?|transfer(?:red)?|bytes_sent=\"?[1-9]|scp|sftp|rsync|stor(?:ed|age)?)\b"),
          "data exfiltration is not established by the cited evidence"),
         (re.compile(r"\b(?:the\s+)?attacker\s+(?:was|is|used|originated|came\s+from)\b"),
          re.compile(r"\b(?:attacker|threat\s+actor|malicious\s+source)\b"),
          "attacker identity is not established by the cited evidence"),
+        (re.compile(r"\bexploit(?:ed|ation)?\s+(?:succeeded|successful|worked)?\b|\bsuccessfully\s+exploited\b"),
+         re.compile(r"\b(?:exploitation\s+succeeded|code\s+execution\s+(?:achieved|observed)|"
+                    r"successful\s+exploit|exploit\s+confirmed|execution\s+confirmed)\b"),
+         "successful exploitation is not established by the presence of a vulnerability identifier alone"),
+        (re.compile(r"\b(?:infected\s+with\s+malware|malware\s+infection|is\s+infected)\b"),
+         re.compile(r"\b(?:malware\s+(?:detected|confirmed|identified)|infection\s+confirmed|"
+                    r"malicious\s+binary\s+(?:executed|found)|known\s+malicious\s+hash\s+match)\b"),
+         "malware infection is not established by suspicious-looking commands or process names alone"),
         (re.compile(r"\b(?:brute[- ]force\s+attack|potential\s+brute[- ]force|consistent\s+with\s+(?:a\s+)?brute[- ]force)\b"),
          re.compile(r"\b(?:brute[- ]force|password\s+guess(?:ing)?|credential\s+attack|automated\s+authentication)\b"),
          "the supplied evidence does not establish a brute-force attack; the authentication pattern may be described only as observed/repeated activity"),
@@ -520,18 +529,127 @@ def _context_status_claim(text: str, proposed_type: str, evidence_texts: list[st
 
 
 
+def _causal_support_gap(claim: str, evidence_texts: list[str]) -> str | None:
+    """Reject causal conclusions that only rest on temporal proximity.
+
+    A claim that one observed activity caused another requires linkage
+    evidence in the cited records: a shared session/process/correlation
+    identifier or an explicit recorded causal action. Timestamps alone do not
+    establish causation.
+    """
+    text = str(claim or "").lower()
+    if not re.search(r"\b(?:caus(?:e|ed|es|ing)|led\s+to|resulted\s+in|triggered|due\s+to|because\s+of)\b", text, re.I):
+        return None
+    # Bounded negations are safe limitations, not causal conclusions.
+    prefix_window = text
+    negation = re.search(
+        r"\b(?:does\s+not|do\s+not|not\s+establish(?:ed)?|cannot\s+establish|"
+        r"no\s+evidence|without\s+evidence|unproven|does\s+not,?\s+by\s+itself)\b",
+        prefix_window,
+        re.I,
+    )
+    if negation and re.search(r"\bcaus|\bled\s+to\b|\bresulted\s+in\b|\btriggered\b", prefix_window[negation.start():negation.start() + 160], re.I):
+        return None
+    evidence = " ".join(str(x or "") for x in evidence_texts).lower()
+    linkage_re = re.compile(
+        r"\b(?:session[_ ]?id|request[_ ]?id|trace[_ ]?id|transaction[_ ]?id|correlation[_ ]?id|"
+        r"flow[_ ]?id|same\s+(?:session|process|pid)|shared\s+(?:session|process|identifier)|"
+        r"caused\s+by|triggered\s+by|parent[_ ]?process)\b",
+        re.I,
+    )
+    if not linkage_re.search(evidence):
+        return (
+            "causal claim is not supported: the cited evidence contains no shared session/process/correlation "
+            "identifier or explicit causal record; temporal proximity alone does not establish causation"
+        )
+    return None
+
+
 def _aggregate_support_gap(claim: str, context: dict[str, Any]) -> tuple[str | None, list[str]]:
     """Validate set-level claims against the complete immutable evidence bundle.
 
     A provider citation is only a pointer; it is not permission to generalize
-    from two cited records to twelve.  Aggregate and universal claims are
-    therefore evaluated against every deterministic record in the bundle.
+    from two cited records to twelve. Aggregate and universal claims are
+    evaluated against every deterministic record in the bundle, OR against a
+    deterministic full-dataset count result when one is available for the same
+    population (the evidence bundle alone is a bounded sample, so a true
+    dataset-level count can legitimately exceed it).
     """
     text = str(claim or "")
     lower = text.lower()
     lookup = _event_lookup(context)
     if not lookup:
         return None, []
+
+    # Deterministic full-dataset count corroboration: when the investigation
+    # ran count_events, its output is an authoritative population size for the
+    # queried filters. A claim matching one of those counts is corroborated
+    # even when the in-memory bundle is smaller; a claim contradicting a
+    # compatible deterministic count is rejected.
+    deterministic_counts = context.get("deterministic_counts") or []
+    count_match = re.search(
+        r"\b(?:total\s+of\s+)?(\d+)\s+(?:failed\s+login\s+attempts?|failed\s+authentication\s+events?|failed\s+logins?|successful\s+logins?|successful\s+authentication\s+events?|matching\s+events?|events?|records?)\b",
+        lower,
+    )
+    if deterministic_counts and count_match:
+        claimed = int(count_match.group(1))
+
+        def _tokens_for_match(value: str, min_len: int) -> set[str]:
+            # Strip trailing punctuation (a sentence period must not prevent
+            # "198.51.100.23." from matching "198.51.100.23") and split
+            # snake_case so query terms align with claim wording.
+            raw = re.findall(r"[a-z0-9_.:/-]+", str(value or "").lower())
+            out: set[str] = set()
+            for token in raw:
+                token = token.strip(".,;:!?")
+                if len(token) < min_len:
+                    continue
+                out.add(token)
+                out.update(part for part in token.split("_") if len(part) >= min_len)
+            return out
+
+        claim_tokens = _tokens_for_match(lower, 3)
+        corroborated = False
+        contradicted_by = None
+        for entry in deterministic_counts:
+            if not isinstance(entry, dict):
+                continue
+            exact = entry.get("exact_count")
+            if exact is None:
+                continue
+            query_text = str(entry.get("query", "") or "").lower()
+            query_tokens = _tokens_for_match(query_text, 2)
+            # Compatibility: the deterministic query shares at least one
+            # distinctive token with the claim (an IP, port, field name, or
+            # value), or the query was unconstrained (whole-dataset count).
+            compatible = not query_text or bool(
+                query_tokens & claim_tokens
+                or any(
+                    len(q) >= 4 and len(c) >= 4 and (q.startswith(c[:4]) or c.startswith(q[:4]))
+                    for q in query_tokens for c in claim_tokens
+                )
+            )
+            if not compatible:
+                continue
+            if int(exact) == claimed:
+                corroborated = True
+                break
+            # Only treat as contradiction when the deterministic query is a
+            # superset token-match of the claim's subject (same distinctive
+            # identifiers); otherwise different filters legitimately differ.
+            if query_tokens & claim_tokens:
+                contradicted_by = (int(exact), query_text)
+        if corroborated:
+            return None, []
+        if contradicted_by and not any(
+            int(e.get("exact_count", -1)) == claimed for e in deterministic_counts if isinstance(e, dict)
+        ):
+            return (
+                f"aggregate count is contradicted by a deterministic full-dataset query: claim says {claimed}, "
+                f"query '{contradicted_by[1]}' returned {contradicted_by[0]} matching record(s)",
+                [],
+            )
+
     records = list(lookup.items())
 
     def event_is_population_member(event: str) -> bool:
@@ -568,6 +686,13 @@ def _aggregate_support_gap(claim: str, context: dict[str, Any]) -> tuple[str | N
     if not population:
         return None, []
     ids = [eid for eid, _ in population]
+
+    # When authoritative deterministic dataset counts exist, the bounded
+    # in-memory bundle must not be used to reject set-level numbers it can
+    # only undersample. Absence of a matching deterministic count is not
+    # evidence of contradiction.
+    if deterministic_counts:
+        return None, ids
 
     count_match = re.search(
         r"\b(?:total\s+of\s+)?(\d+)\s+(?:failed\s+login\s+attempts?|failed\s+authentication\s+events?|failed\s+logins?|successful\s+logins?|successful\s+authentication\s+events?|events?|records?)\b",
@@ -728,6 +853,18 @@ def _classify_claim(
         or bool(_INFERENCE_RE.search(text))
         or section in {"AI INTERPRETATION", "RISK ASSESSMENT", "OVERALL ASSESSMENT"}
     )
+    is_hypothesis = proposed in {"HYPOTHESIS", "POSSIBLE_EXPLANATION", "THEORY"}
+
+    # Causal claims require linkage evidence, not temporal proximity. A claim
+    # that event set A caused event set B is only groundable when the cited
+    # evidence contains a shared identifier or an explicit causal record.
+    causal_gap = _causal_support_gap(text, [lookup[evid] for evid in evidence_ids])
+    if causal_gap:
+        return GroundedClaim(
+            text=text, type=UNSUPPORTED_CLAIM, evidence_references=evidence_ids,
+            confidence=LOW, grounding_status="REJECTED", validation_status=REJECTED, section=section,
+            reason=causal_gap,
+        )
 
     if mismatches:
         detail = "; ".join(f"{e}: {len(v)} concrete attribute(s) missing" for e, v in mismatches.items())
@@ -735,6 +872,17 @@ def _classify_claim(
             text=text, type=UNSUPPORTED_CLAIM, evidence_references=evidence_ids,
             confidence=LOW, grounding_status="REJECTED", validation_status=REJECTED, section=section,
             reason=f"Concrete claim attributes are not present in the cited immutable record(s): {detail}",
+        )
+
+    if is_hypothesis and is_interpretation:
+        # Provider-proposed hypotheses stay visibly distinct from facts and
+        # from grounded interpretations: they are plausible explanations that
+        # still require additional evidence.
+        return GroundedClaim(
+            text=text, type=HYPOTHESIS, evidence_references=evidence_ids,
+            confidence=LOW, grounding_status="ACCEPTED",
+            validation_status=ACCEPTED_AS_INTERPRETATION, section=section,
+            reason="Hypothesis anchored to cited evidence; explicitly not established as fact.",
         )
 
     # An AI cannot promote an inference into a verified fact simply by asking
@@ -855,6 +1003,7 @@ def normalize_provider_analysis(answer: str, context: dict[str, Any]) -> dict[st
     accepted = [c for c in claims if c.validation_status in {ACCEPTED, ACCEPTED_AS_INTERPRETATION}]
     accepted_facts = [c for c in accepted if c.type == VERIFIED_FACT]
     accepted_interpretations = [c for c in accepted if c.type == GROUNDED_INTERPRETATION]
+    hypotheses = [c for c in accepted if c.type == HYPOTHESIS]
     recommendations = [c for c in accepted if c.type == RECOMMENDATION]
     review_items = [c for c in claims if c.validation_status == REVIEW_REQUIRED]
     rejected = [c for c in claims if c.validation_status in {REJECTED, REJECTED_CONTRADICTED}]
@@ -916,6 +1065,7 @@ def normalize_provider_analysis(answer: str, context: dict[str, Any]) -> dict[st
         "accepted_claims": [c.to_dict() for c in accepted],
         "accepted_facts": [c.to_dict() for c in accepted_facts],
         "accepted_interpretations": [c.to_dict() for c in accepted_interpretations],
+        "hypotheses": [c.to_dict() for c in hypotheses],
         "recommendations": [c.to_dict() for c in recommendations],
         "review_items": [c.to_dict() for c in review_items],
         "insufficient_context_claims": [c.to_dict() for c in review_items],
@@ -947,6 +1097,7 @@ def render_analyst_report(analysis: dict[str, Any]) -> str:
     ]
     facts = [x for x in accepted if x.get("type") == VERIFIED_FACT]
     interpretations = [x for x in accepted if x.get("type") == GROUNDED_INTERPRETATION]
+    hypotheses = [x for x in accepted if x.get("type") == HYPOTHESIS]
     review_items = [
         x for x in claims
         if x.get("validation_status") == REVIEW_REQUIRED
@@ -996,6 +1147,18 @@ def render_analyst_report(analysis: dict[str, Any]) -> str:
         lines += ["", "AI INTERPRETATION (ADVISORY)"]
         seen = set()
         for item in interpretations[:12]:
+            key = re.sub(r"\s+", " ", str(item.get("text", ""))).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            refs = " ".join(f"[{x}]" for x in item.get("evidence_references", []))
+            display_text = re.sub(r"\s*\[(?:EVID-\d+)\]", "", str(item.get("text", ""))).strip()
+            lines.append(f"• {display_text}" + (f" {refs}" if refs else ""))
+
+    if hypotheses:
+        lines += ["", "HYPOTHESES (PLAUSIBLE, NOT ESTABLISHED)"]
+        seen = set()
+        for item in hypotheses[:8]:
             key = re.sub(r"\s+", " ", str(item.get("text", ""))).strip().lower()
             if not key or key in seen:
                 continue

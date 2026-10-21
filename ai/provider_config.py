@@ -13,8 +13,8 @@ CREDENTIAL_TARGET = "LogAsis/LiveAI/APIKey"
 
 LIVE_AI_DEFAULTS = {
     "OpenAI": ("gpt-4o-mini", "https://api.openai.com/v1"),
-    "Google Gemini": ("gemini-3.5-flash", "https://generativelanguage.googleapis.com/v1beta/openai"),
-    "NVIDIA NIM": ("nvidia/nemotron-3-ultra-550b-a55b", "https://integrate.api.nvidia.com/v1"),
+    "Google Gemini": ("gemini-2.0-flash", "https://generativelanguage.googleapis.com/v1beta/openai"),
+    "NVIDIA NIM": ("nvidia/llama-3.3-nemotron-super-49b-v1.5", "https://integrate.api.nvidia.com/v1"),
     "OpenAI-Compatible": ("", ""),
 }
 

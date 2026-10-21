@@ -37,6 +37,14 @@ class QueryPlan:
     group_field: str | None = None
     time_start: datetime | None = None
     time_end: datetime | None = None
+    # Set by compile(): non-empty means the plan is invalid and must not be
+    # executed. This prevents a malformed model-produced plan from silently
+    # degrading into a broader (or "match everything") query.
+    validation_errors: list[str] = field(default_factory=list)
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.validation_errors
 
 
 class QueryEngine:
@@ -58,8 +66,13 @@ class QueryEngine:
     def execute(self, plan: QueryPlan | dict[str, Any]) -> dict[str, Any]:
         if isinstance(plan, dict):
             plan = self.compile(plan)
-        if plan is None:
-            return {"positions": [], "count": 0, "error": "Invalid query plan"}
+        if plan is None or (getattr(plan, "validation_errors", None) and not plan.is_valid):
+            errors = getattr(plan, "validation_errors", None) or ["Invalid query plan"]
+            return {
+                "positions": [], "count": 0, "returned_count": 0,
+                "truncated": False, "exhaustive": False,
+                "error": "; ".join(errors),
+            }
 
         op = plan.operation.upper()
 
@@ -99,6 +112,16 @@ class QueryEngine:
     def compile(self, raw: dict[str, Any]) -> QueryPlan | None:
         if not isinstance(raw, dict):
             return None
+        # A bare field/value mapping is a leaf condition, not an unbounded
+        # sub-plan. Without this normalization, {"field": ..., "operator":
+        # "EXACT", "value": ...} compiled to an empty AND that matched every
+        # row in the dataset -- silently converting a filter into
+        # "match everything" (and NOT into "match nothing").
+        if not raw.get("operation") and (raw.get("field") or ("value" in raw and "conditions" not in raw)):
+            leaf_op = str(raw.get("operator", "EXACT")).upper()
+            if leaf_op not in {"EXACT", "CONTAINS", "PREFIX", "REGEX", "RANGE", "IN", "DISTINCT"}:
+                return None
+            raw = {"operation": leaf_op, **raw}
         op = str(raw.get("operation", "AND")).upper()
         if op not in self.VALID_OPERATORS:
             return None
@@ -111,17 +134,29 @@ class QueryEngine:
                     sub_plan = self.compile(sub)
                     if sub_plan:
                         plan.sub_plans.append(sub_plan)
+                    else:
+                        plan.validation_errors.append(
+                            f"Invalid sub-condition in {op}: {sub!r}"
+                        )
             for sub in raw.get("sub_plans", []):
                 if isinstance(sub, dict):
                     sub_plan = self.compile(sub)
                     if sub_plan:
                         plan.sub_plans.append(sub_plan)
+                    else:
+                        plan.validation_errors.append(
+                            f"Invalid sub-plan in {op}: {sub!r}"
+                        )
         elif op == "NOT":
             sub = raw.get("condition") or raw.get("sub_plan")
             if isinstance(sub, dict):
                 sub_plan = self.compile(sub)
                 if sub_plan:
                     plan.sub_plans.append(sub_plan)
+                else:
+                    plan.validation_errors.append("NOT requires a valid sub-plan")
+            else:
+                plan.validation_errors.append("NOT requires a sub-plan")
         elif op in ("EXACT", "CONTAINS", "PREFIX", "REGEX", "RANGE", "IN"):
             plan.conditions = [QueryCondition(
                 field=str(raw.get("field", "")),
@@ -132,6 +167,10 @@ class QueryEngine:
         elif op == "TIME_RANGE":
             plan.time_start = self._parse_time_value(raw.get("start"))
             plan.time_end = self._parse_time_value(raw.get("end"))
+            if raw.get("start") and plan.time_start is None:
+                plan.validation_errors.append(f"Unparseable time_range start: {raw.get('start')!r}")
+            if raw.get("end") and plan.time_end is None:
+                plan.validation_errors.append(f"Unparseable time_range end: {raw.get('end')!r}")
         elif op == "COUNT":
             sub = raw.get("condition") or raw.get("sub_plan")
             if isinstance(sub, dict):
@@ -177,6 +216,26 @@ class QueryEngine:
             plan.sort_desc = bool(raw["sort_desc"])
         if raw.get("group_field"):
             plan.group_field = str(raw["group_field"])
+
+        # Schema validation: reject unknown fields instead of executing a
+        # query that can only ever return zero rows while looking plausible.
+        # TIME_RANGE/GROUP-by-timestamp style operations validate their fields
+        # the same way. Internal derived columns are allowed.
+        known_fields = set(self.index.search_fields)
+        known_fields.update({"timestamp_dt", "hour", "date", "line"})
+        leaf_fields: list[str] = []
+        for cond in plan.conditions:
+            if cond.field:
+                leaf_fields.append(cond.field)
+        if plan.sort_field:
+            leaf_fields.append(plan.sort_field)
+        if plan.group_field:
+            leaf_fields.append(plan.group_field)
+        for fname in leaf_fields:
+            if fname and fname not in known_fields:
+                plan.validation_errors.append(f"Unknown field: {fname}")
+        for sub in plan.sub_plans:
+            plan.validation_errors.extend(sub.validation_errors)
 
         return plan
 
@@ -264,9 +323,22 @@ class QueryEngine:
     def _execute_time_range(self, plan: QueryPlan) -> dict[str, Any]:
         if plan.time_start and plan.time_end:
             positions = self.index.timestamp_range(plan.time_start, plan.time_end)
+        elif plan.time_start:
+            positions = self._filter_positions_by_time(lambda ts: ts >= plan.time_start)
+        elif plan.time_end:
+            positions = self._filter_positions_by_time(lambda ts: ts <= plan.time_end)
         else:
             positions = list(self.index.all_positions())
         return self._finalize(positions, plan)
+
+    def _filter_positions_by_time(self, predicate) -> list[int]:
+        out = []
+        for pos in self.index.all_positions():
+            event = self.index.get_event(pos)
+            ts = self.index._parse_timestamp(event.get("timestamp")) if event else None
+            if ts is not None and predicate(ts):
+                out.append(pos)
+        return out
 
     def _execute_in(self, plan: QueryPlan) -> dict[str, Any]:
         if not plan.conditions:
@@ -338,7 +410,14 @@ class QueryEngine:
             decorated.sort(key=lambda x: x[0], reverse=plan.sort_desc)
             positions = [pos for _, pos in decorated]
         limit = plan.limit or 10
-        return {"positions": positions[:limit], "count": min(len(positions), limit)}
+        return {
+            "positions": positions[:limit],
+            "count": len(positions),
+            "returned_count": min(len(positions), limit),
+            "truncated": len(positions) > limit,
+            "exhaustive": len(positions) <= limit,
+            "aggregation": "top_k",
+        }
 
     def _condition_positions(self, cond: QueryCondition) -> set[int]:
         op = cond.operator.upper()
@@ -388,26 +467,55 @@ class QueryEngine:
         return positions
 
     def _finalize(self, positions: list[int], plan: QueryPlan) -> dict[str, Any]:
-        result = {"positions": positions, "count": len(positions)}
-        if plan.limit is not None and plan.limit > 0:
+        """Finalize a result.
+
+        ``count`` is ALWAYS the size of the complete matching set, never the
+        truncated sample. ``returned_count``/``truncated`` describe the bounded
+        sample separately so exact counts cannot be corrupted by a result
+        limit (the previous implementation overwrote count with the truncated
+        length, which produced wrong exact counts whenever a limit applied).
+        """
+        count = len(positions)
+        result = {
+            "positions": positions,
+            "count": count,
+            "returned_count": count,
+            "truncated": False,
+            "exhaustive": True,
+        }
+        if plan.limit is not None and plan.limit > 0 and count > plan.limit:
             result["positions"] = positions[:plan.limit]
-            result["count"] = len(result["positions"])
+            result["returned_count"] = plan.limit
+            result["truncated"] = True
+            result["exhaustive"] = False
         return result
 
     @staticmethod
     def _parse_time_value(value: Any) -> datetime | None:
         if isinstance(value, datetime):
-            return value
-        if not value:
-            return None
-        text = str(value).strip()
-        try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            pass
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            parsed = value
+        else:
+            if not value:
+                return None
+            text = str(value).strip()
+            parsed = None
             try:
-                return datetime.strptime(text, fmt)
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
             except (ValueError, TypeError):
-                continue
-        return None
+                pass
+            if parsed is None:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        parsed = datetime.strptime(text, fmt)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+            if parsed is None:
+                return None
+        # The index normalizes timestamps to UTC-aware; comparisons against
+        # naive datetimes would raise TypeError on mixed datasets.
+        if parsed.tzinfo is None:
+            from datetime import timezone as _tz
+
+            return parsed.replace(tzinfo=_tz.utc)
+        return parsed.astimezone(parsed.tzinfo)

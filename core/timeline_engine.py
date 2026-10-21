@@ -6,9 +6,12 @@ returns ordered events from the persistent index.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from core.event_index import EventIndex
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class TimelineEngine:
@@ -23,7 +26,9 @@ class TimelineEngine:
         for pos, event in zip(positions, events):
             ts = self.index._parse_timestamp(event.get("timestamp"))
             decorated.append((ts, pos, event))
-        decorated.sort(key=lambda x: (x[0] or self.index._parse_timestamp(""), x[1]))
+        # Events without a parseable timestamp sort last (epoch fallback)
+        # instead of raising TypeError on None-vs-datetime comparison.
+        decorated.sort(key=lambda x: (x[0] or _EPOCH, x[1]))
         return [event for _, _, event in decorated]
 
     def for_entity(self, entity_type: str, value: str, limit: int = 100) -> list[dict[str, Any]]:

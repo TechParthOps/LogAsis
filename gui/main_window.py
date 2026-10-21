@@ -88,6 +88,7 @@ from core.reporting import build_investigation_pack, export_json as export_inves
 from core.case_handoff import CaseHandoffEngine
 from core.case_package import CasePackageEngine, CasePackageError
 from core.event_index import EventIndex
+from core.log_dataset import safe_frame_records
 from core.log_dataset import LogDataset, DatasetSession
 from core.workspace_journal import WorkspaceJournal
 from core.investigation_guidance import derive_guidance
@@ -549,6 +550,80 @@ a:hover { text-decoration: underline; }
 </style></head><body>""" + metadata + "".join(body) + "</body></html>"
 
 
+class IngestionWorker(QObject):
+    """Parses and indexes an uploaded log off the Qt GUI thread.
+
+    Previously the whole upload pipeline (file read, parse, DataFrame build,
+    EventIndex build, analytics cache, evidence manifest) ran synchronously in
+    ``MainWindow.load_log_file``. For large files the GUI event loop stalled
+    and Windows marked the window "Not responding". This worker moves the
+    expensive stages to a background thread; the GUI thread only renders the
+    finished dataset.
+    """
+    progress = Signal(int, int, str)
+    finished = Signal(int, object, object, dict, str)
+    failed = Signal(int, str)
+
+    def __init__(self, generation, path):
+        super().__init__()
+        self.generation = int(generation)
+        self.path = str(path)
+        self._cancel_requested = False
+
+    def run(self):
+        try:
+            path = self.path
+            self.progress.emit(self.generation, 8, f"Reading {Path(path).name}…")
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+            self._check_cancel()
+            self.progress.emit(self.generation, 20, "Detecting log profile…")
+            base_profile = detect_log_profile(path, text)
+
+            self.progress.emit(self.generation, 35, "Parsing events…")
+            if base_profile["parser"] == "json":
+                events = JsonLogParser().parse(text)
+            else:
+                events = SyslogParser().parse(text)
+            self._check_cancel()
+
+            self.progress.emit(self.generation, 55, "Normalizing event records…")
+            decision = classify_dashboard_profile(base_profile, events=events, raw_text=text)
+            parsed_df = events_to_dataframe(events)
+            self._check_cancel()
+
+            self.progress.emit(self.generation, 78, "Building the persistent event index…")
+            dataset = LogDataset(parsed_df, source_file=path)
+            # Warm the evidence catalog in this background thread so the first
+            # AI question does not pay a full catalog build per session.
+            self.progress.emit(self.generation, 88, "Preparing the AI evidence catalog…")
+            try:
+                dataset.get_tool_catalog()
+            except Exception:
+                pass
+            profile = {
+                "id": decision.profile_id,
+                "name": decision.name,
+                "parser": base_profile.get("parser", ""),
+                "confidence": decision.confidence,
+                "matched_signals": decision.matched_signals,
+            }
+            self.progress.emit(self.generation, 95, "Index ready")
+            self.finished.emit(self.generation, parsed_df, dataset, profile, path)
+        except Exception as exc:
+            self.failed.emit(self.generation, str(exc))
+
+    def _check_cancel(self):
+        if self._cancel_requested:
+            raise IngestionCancelledError("Load cancelled by analyst.")
+
+    def cancel(self):
+        self._cancel_requested = True
+
+
+class IngestionCancelledError(RuntimeError):
+    pass
+
+
 class AIWorker(QObject):
     # answer, provider label, model name
     finished = Signal(str, str, str)
@@ -556,13 +631,18 @@ class AIWorker(QObject):
     prepared = Signal(str)
     progress = Signal(int, str)
 
-    def __init__(self, provider_name, question, df, source_file="", dataset=None):
+    def __init__(self, provider_name, question, df, source_file="", dataset=None, conversation_context=None):
         super().__init__()
         self.provider_name = provider_name
         self.question = question
-        self.df = df.copy()
+        # No df.copy() here: copying a large loaded log (100k+ rows) on the
+        # GUI thread froze the window every time Analyze was clicked. The
+        # dataset session is immutable for this request — a new upload resets
+        # the AI session generation and cancels this worker.
+        self.df = df
         self.source_file = str(source_file or "")
         self.dataset = dataset
+        self.conversation_context = list(conversation_context or [])
         self.cancel_requested = False
         self.session_generation = 0
 
@@ -581,7 +661,11 @@ class AIWorker(QObject):
             agent = LogInvestigatorAgent.with_provider(
                 self.provider_name, progress_callback=self._progress
             )
-            answer = agent.answer(self.question, self.df, self.source_file, dataset=self.dataset)
+            answer = agent.answer(
+                self.question, self.df, self.source_file,
+                dataset=self.dataset,
+                conversation_context=self.conversation_context,
+            )
             provider = getattr(agent, "provider", None)
             provider_label = getattr(provider, "name", self.provider_name)
             model = getattr(provider, "model", "") or "configured model"
@@ -634,17 +718,23 @@ class AnalysisWorker(QObject):
     finished = Signal(int, object)
     failed = Signal(int, str)
 
-    def __init__(self, generation, events, source_file):
+    def __init__(self, generation, df, source_file):
         super().__init__()
         self.generation = generation
-        self.events = events
+        self.df = df
         self.source_file = source_file
 
     def run(self):
         try:
             self.progress.emit(10, "Preparing deterministic analysis…")
             self._check_cancel()
-            events = list(self.events)
+            # Convert the DataFrame to event dicts inside the worker thread.
+            # Doing this on the GUI thread (the previous behavior) froze the
+            # interface for large datasets. Datetime columns are serialized
+            # safely (a naive df.fillna("") crashes on NaT values).
+            from core.log_dataset import LogDataset as _LD
+
+            events = _LD._index_records(self.df)
 
             self.progress.emit(30, "Building investigation candidates…")
             report = build_investigation_report(pd.DataFrame(events))
@@ -729,8 +819,15 @@ class MainWindow(QMainWindow):
         self._analysis_thread = None
         self._analysis_worker = None
         self._analysis_cache = None
+        self._ingestion_generation = 0
+        self._ingestion_thread = None
+        self._ingestion_worker = None
         self._ai_thread = None
         self._ai_worker = None
+        # Prior questions in the current AI Analyst session, used to resolve
+        # contextual references such as "this source" without leaking any
+        # ground-truth information.
+        self._ai_session_questions: list[str] = []
         self._event_page = 0
         self._event_page_size = 500
         self._event_page_count = 1
@@ -1686,18 +1783,28 @@ class MainWindow(QMainWindow):
         if self.df.empty:
             return
 
-        events = self.df.fillna("").to_dict("records")
-        if self._analysis_cache and len(self.filtered_df) == len(self.df):
+        # IOC extraction and detection runs are owned by the background
+        # AnalysisWorker; running them inline here froze the GUI on large
+        # logs. Render cached results, or placeholders until the worker
+        # finishes. When an Events filter is active, the cached full-dataset
+        # inventory stays authoritative and is labelled as such.
+        filtered = len(self.filtered_df) != len(self.df)
+        if self._analysis_cache:
             self._iocs = self._normalize_ioc_inventory(self._analysis_cache.get("iocs", {}))
             self._detections = list(self._analysis_cache.get("detections", []))
+            scope_note = " (filtered view; counts are for the full dataset)" if filtered else ""
         else:
-            self._iocs = extract_iocs(events)
-            self._detections = self.detection_engine.run(events)
+            self._iocs = {k: [] for k in ("ipv4", "domain", "url", "hash", "username", "process")}
+            self._detections = []
+            scope_note = " — background analysis in progress…"
+        events_count = len(self.df)
         counts = summarize_iocs(self._iocs)
 
-        self._safe_set_label_text(self.ops_metrics.get("events"), str(len(events)))
+        self._safe_set_label_text(self.ops_metrics.get("events"), str(events_count))
         self._safe_set_label_text(self.ops_metrics.get("iocs"), str(sum(counts.values())))
-        self._safe_set_label_text(self.ops_metrics.get("detections"), str(len(self._detections)))
+        self._safe_set_label_text(
+            self.ops_metrics.get("detections"), str(len(self._detections)) + ("*" if filtered else "")
+        )
         self._safe_set_label_text(
             self.ops_metrics.get("critical"),
             str(sum(1 for x in self._detections if x.get("severity") == "CRITICAL")),
@@ -1710,6 +1817,8 @@ class MainWindow(QMainWindow):
             self.ops_metrics.get("cases"),
             str(len(self.case_store.records)),
         )
+        if scope_note and hasattr(self, "ops_integrity"):
+            self._safe_set_label_text(self.ops_integrity, f"Scope: {scope_note.strip()}")
 
         self._render_ioc_inventory(self._filtered_ioc_rows())
 
@@ -1741,12 +1850,17 @@ class MainWindow(QMainWindow):
         self.ops_detection_table.setSortingEnabled(True)
 
         try:
-            manifest = build_evidence_manifest(
-                self.current_file, events, self.evidence_store.records
-            )
+            # The integrity manifest over the full dataset is computed by the
+            # background AnalysisWorker; reuse it instead of re-serializing
+            # every event on the GUI thread.
+            manifest = (self._analysis_cache or {}).get("manifest")
+            if manifest is None:
+                manifest = build_evidence_manifest(
+                    self.current_file, [], self.evidence_store.records
+                )
             self._safe_set_label_text(
                 self.ops_integrity,
-                f"SHA-256: {manifest['source_sha256'][:20]}… | Events: {len(events)}",
+                f"SHA-256: {str(manifest.get('source_sha256', ''))[:20]}… | Events: {events_count}",
             )
         except Exception as exc:
             self._safe_set_label_text(
@@ -1754,7 +1868,7 @@ class MainWindow(QMainWindow):
             )
 
     def _build_current_investigation_pack(self):
-        events=self.df.fillna("").to_dict("records")
+        events=safe_frame_records(self.df)
         if not events: return None
         if not self._iocs: self._iocs=extract_iocs(events)
         if not self._detections: self._detections=self.detection_engine.run(events)
@@ -2100,17 +2214,13 @@ class MainWindow(QMainWindow):
         self._clear_dashboard_findings()
 
         findings = list(getattr(self, "_detections", []) or [])
-        if not findings and not self.df.empty:
-            # refresh_all normally populates detections through Operations.
-            # This fallback keeps the dashboard self-contained when it is
-            # opened directly after a load.
-            try:
-                findings = self.detection_engine.run(
-                    self.df.fillna("").to_dict("records")
-                )
-                self._detections = findings
-            except Exception:
-                findings = []
+        if not findings and self._analysis_cache:
+            findings = list(self._analysis_cache.get("detections", []) or [])
+            self._detections = findings
+        # Deliberately NO inline detection run here: running the detection
+        # engine over a large loaded log on the GUI thread froze the window.
+        # The background AnalysisWorker populates detections and refreshes
+        # the dashboard when it completes.
 
         order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
         findings = sorted(
@@ -2358,26 +2468,11 @@ class MainWindow(QMainWindow):
         suggestion_grid = QGridLayout()
         suggestion_grid.setHorizontalSpacing(6)
         suggestion_grid.setVerticalSpacing(5)
-        suggested_questions = [
-            "Which account was compromised?",
-            "What attack type was used to gain initial access?",
-            "What is the attacker's IP address?",
-            "What file was exfiltrated once root was gained?",
-            "What type of vulnerability is this?",
-            "What is the name of the binary and PID used to gain root?",
-            "What tool was used to perform system enumeration?",
-            "What CVE was exploited to gain root access?",
-            "Summarize highest-risk findings",
-            "Explain critical activity",
-            "Identify suspicious users",
-            "What evidence supports the top finding?",
-        ]
-        for idx, text in enumerate(suggested_questions):
-            btn = QPushButton(text)
-            btn.setObjectName("secondaryButton")
-            btn.setToolTip("Ask this question against the loaded log evidence.")
-            btn.clicked.connect(lambda checked=False, q=text: self._set_ai_question(q))
-            suggestion_grid.addWidget(btn, idx // 4, idx % 4)
+        # Suggested questions are derived from the LOADED log (log type,
+        # available fields, incident profile) — never a fixed list. See
+        # core/question_suggestions.py and _refresh_ai_suggestions().
+        self._ai_suggestion_grid = suggestion_grid
+        self._ai_suggestion_buttons: list[QPushButton] = []
         suggestions.addLayout(suggestion_grid)
         layout.addLayout(suggestions)
 
@@ -2420,6 +2515,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.ai_grounding_output)
 
         self._ai_provider_changed(self.ai_provider.currentText())
+        self._refresh_ai_suggestions()
 
     def _toggle_ai_grounding_details(self, checked):
         if not hasattr(self, "ai_grounding_output"):
@@ -2430,6 +2526,50 @@ class MainWindow(QMainWindow):
     def _set_ai_question(self, question):
         self.ai_question.setText(question)
         self.ai_question.setFocus()
+
+    def _refresh_ai_suggestions(self):
+        """Rebuild the suggested-question buttons for the loaded log.
+
+        Questions are derived from the actual dataset (log type, fields,
+        incident profile) so a Windows/Sysmon, web, firewall, DNS, or JSON
+        log gets questions that make sense for it instead of the fixed
+        auditd-oriented list.
+        """
+        grid = getattr(self, "_ai_suggestion_grid", None)
+        if grid is None:
+            return
+        for btn in getattr(self, "_ai_suggestion_buttons", []):
+            try:
+                btn.setParent(None)
+                btn.deleteLater()
+            except Exception:
+                pass
+        self._ai_suggestion_buttons = []
+
+        questions: list[str] = []
+        dataset = getattr(self.dataset_session, "dataset", None) if hasattr(self, "dataset_session") else None
+        df = getattr(self, "df", None)
+        if dataset is not None and df is not None and len(df) > 0:
+            try:
+                from core.question_suggestions import suggest_questions
+
+                questions = suggest_questions(df, dataset)
+            except Exception:
+                questions = []
+        if not questions:
+            questions = [
+                "What are the most important security findings in this log?",
+                "What event types appear in this log?",
+                "Summarize highest-risk findings",
+                "Explain critical activity",
+            ]
+        for idx, text in enumerate(questions):
+            btn = QPushButton(text)
+            btn.setObjectName("secondaryButton")
+            btn.setToolTip("Ask this question against the loaded log evidence.")
+            btn.clicked.connect(lambda checked=False, q=text: self._set_ai_question(q))
+            grid.addWidget(btn, idx // 4, idx % 4)
+            self._ai_suggestion_buttons.append(btn)
 
     def _ai_provider_changed(self, provider):
         if provider == "Live AI":
@@ -2502,6 +2642,7 @@ class MainWindow(QMainWindow):
         """Reset only AI Analyst state for a new evidence session."""
         self._ai_session_generation = int(getattr(self, "_ai_session_generation", 0)) + 1
         clear_ai_session_cache()
+        self._ai_session_questions = []
 
         worker = getattr(self, "_ai_worker", None)
         if worker is not None:
@@ -2584,7 +2725,11 @@ class MainWindow(QMainWindow):
             self.df,
             self.current_file,
             dataset=self.dataset_session.dataset,
+            conversation_context=list(self._ai_session_questions),
         )
+        self._ai_session_questions.append(question)
+        if len(self._ai_session_questions) > 12:
+            del self._ai_session_questions[:-12]
         self._ai_worker.session_generation = request_generation
         self._ai_worker.moveToThread(self._ai_thread)
         self._ai_thread.started.connect(self._ai_worker.run)
@@ -3863,7 +4008,7 @@ class MainWindow(QMainWindow):
             if key[0] or key[1] or key[2]:
                 existing[key] = item
 
-        for row in self.df.fillna("").to_dict("records"):
+        for row in safe_frame_records(self.df):
             event = dict(row)
             event["source_file"] = str(event.get("source_file", "") or self.current_file or "")
             key = (
@@ -6228,79 +6373,138 @@ class MainWindow(QMainWindow):
             return
         self.load_log_file(path, show_errors=True)
 
-    def load_log_file(self, path, show_errors=False):
+    def load_log_file(self, path, show_errors=False, blocking=False):
         """Load a known log path and start the normal analysis pipeline.
 
         This is intentionally shared by the file picker and crash-recovery
-        paths.  Recovery must invoke the exact same loader as a normal upload;
+        paths. Recovery must invoke the exact same loader as a normal upload;
         otherwise reopening the journal only restores metadata without
         rebuilding the parsed dataframe and restarting background analysis.
+
+        By default parsing/indexing runs on a background thread so the window
+        stays responsive ("Not responding" occurred when the whole pipeline
+        executed on the GUI thread). ``blocking=True`` preserves the old
+        synchronous behavior for programmatic callers and tests.
         """
         try:
             path = str(Path(path).expanduser().resolve())
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
-            base_profile = detect_log_profile(path, text)
-
-            if base_profile["parser"] == "json":
-                events = JsonLogParser().parse(text)
-            else:
-                events = SyslogParser().parse(text)
-
-            # Parser type and dashboard type are intentionally separate.
-            decision = classify_dashboard_profile(
-                base_profile,
-                events=events,
-                raw_text=text,
-            )
-            self.log_profile = {
-                "id": decision.profile_id,
-                "name": decision.name,
-                "parser": base_profile.get("parser", ""),
-                "confidence": decision.confidence,
-                "matched_signals": decision.matched_signals,
-            }
-
-            # Successful upload starts a new AI Analyst session. A parse failure
-            # leaves the current investigation and its AI session untouched.
-            parsed_df = events_to_dataframe(events)
-            dataset = LogDataset(parsed_df, source_file=path)
-            self._reset_ai_analyst_session(
-                f"New log loaded: {Path(path).name}. Previous AI analysis was cleared."
-            )
-            self.df = parsed_df
-            self.filtered_df = self.df.copy()
-            self.current_file = path
-            self.dataset_session.set_dataset(dataset)
-            # UI filters and the AI investigation share one EventIndex.
-            self.event_index = dataset.event_index
-            self._event_page = 0
-            self._journal_workspace_state("loaded")
-            self.display_columns = display_columns_for_profile(self.log_profile["id"], self.df)
-            self._rebuild_filter_fields()
-            self._safe_set_label_text(
-                self.dashboard_profile,
-                f"Dashboard profile: {self.log_profile['name']} • {Path(path).name}",
-            )
-            self.tabs.setTabText(
-                self.tabs.indexOf(self.dashboard_tab),
-                f"Dashboard • {self.log_profile['name']}",
-            )
-
-            self._safe_set_label_text(
-                self.status,
-                f"{Path(path).name} | Parser: {base_profile['name']} | "
-                f"Dashboard: {self.log_profile['name']} | Events: {len(self.df)}",
-            )
-
-            self.render_events(self.filtered_df)
-            self.refresh_all(include_heavy=False)
-            self.tabs.setCurrentWidget(self.events_tab)
-            self._start_background_analysis()
-            return True
         except Exception as exc:
             if show_errors:
                 QMessageBox.critical(self, "Import failed", str(exc))
             return False
+        if blocking:
+            try:
+                df, dataset, profile, base_parser_name = self._ingest_path(path)
+            except Exception as exc:
+                if show_errors:
+                    QMessageBox.critical(self, "Import failed", str(exc))
+                return False
+            self._apply_ingested_dataset(df, dataset, profile, path, base_parser_name)
+            return True
+
+        # Refuse to stack a second ingestion while one is running.
+        if getattr(self, "_ingestion_thread", None) is not None and self._ingestion_thread.isRunning():
+            self.statusBar().showMessage("A log is already being loaded; please wait for it to finish.", 5000)
+            return False
+
+        self._ingestion_generation += 1
+        generation = self._ingestion_generation
+        self.statusBar().showMessage(f"Loading {Path(path).name} in the background…")
+        thread = QThread(self)
+        worker = IngestionWorker(generation, path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._ingestion_progress)
+        worker.finished.connect(self._ingestion_finished)
+        worker.failed.connect(self._ingestion_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._ingestion_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._ingestion_thread = thread
+        self._ingestion_worker = worker
+        thread.start()
+        return True
+
+    def _ingest_path(self, path):
+        """Synchronous ingestion used by blocking mode."""
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        base_profile = detect_log_profile(path, text)
+        if base_profile["parser"] == "json":
+            events = JsonLogParser().parse(text)
+        else:
+            events = SyslogParser().parse(text)
+        decision = classify_dashboard_profile(base_profile, events=events, raw_text=text)
+        parsed_df = events_to_dataframe(events)
+        dataset = LogDataset(parsed_df, source_file=path)
+        profile = {
+            "id": decision.profile_id,
+            "name": decision.name,
+            "parser": base_profile.get("parser", ""),
+            "confidence": decision.confidence,
+            "matched_signals": decision.matched_signals,
+        }
+        return parsed_df, dataset, profile, base_profile.get("parser", "")
+
+    def _ingestion_progress(self, generation, percent, message):
+        if generation != self._ingestion_generation:
+            return
+        self.statusBar().showMessage(str(message))
+
+    def _ingestion_finished(self, generation, df, dataset, profile, path):
+        if generation != self._ingestion_generation:
+            return
+        self._apply_ingested_dataset(df, dataset, profile, path, profile.get("parser", ""))
+        self.statusBar().showMessage(f"{Path(path).name} loaded • {len(df):,} events indexed.", 8000)
+
+    def _ingestion_failed(self, generation, message):
+        if generation != self._ingestion_generation:
+            return
+        QMessageBox.critical(self, "Import failed", str(message))
+
+    def _ingestion_thread_finished(self):
+        self._ingestion_worker = None
+        self._ingestion_thread = None
+
+    def _apply_ingested_dataset(self, df, dataset, profile, path, base_parser_name):
+        """Apply a fully ingested dataset to the workspace (GUI thread)."""
+        self.log_profile = dict(profile)
+        # Successful upload starts a new AI Analyst session. A parse failure
+        # leaves the current investigation and its AI session untouched.
+        parsed_df = df
+        self._reset_ai_analyst_session(
+            f"New log loaded: {Path(path).name}. Previous AI analysis was cleared."
+        )
+        self.df = parsed_df
+        self.filtered_df = self.df.copy()
+        self.current_file = path
+        self.dataset_session.set_dataset(dataset)
+        # Suggested questions must match the new log's type and content.
+        self._refresh_ai_suggestions()
+        # UI filters and the AI investigation share one EventIndex.
+        self.event_index = dataset.event_index
+        self._event_page = 0
+        self._journal_workspace_state("loaded")
+        self.display_columns = display_columns_for_profile(self.log_profile["id"], self.df)
+        self._rebuild_filter_fields()
+        self._safe_set_label_text(
+            self.dashboard_profile,
+            f"Dashboard profile: {self.log_profile['name']} • {Path(path).name}",
+        )
+        self.tabs.setTabText(
+            self.tabs.indexOf(self.dashboard_tab),
+            f"Dashboard • {self.log_profile['name']}",
+        )
+        self._safe_set_label_text(
+            self.status,
+            f"{Path(path).name} | Parser: {base_parser_name} | "
+            f"Dashboard: {self.log_profile['name']} | Events: {len(self.df)}",
+        )
+        self.render_events(self.filtered_df)
+        self.refresh_all(include_heavy=False)
+        self.tabs.setCurrentWidget(self.events_tab)
+        self._start_background_analysis()
 
     @staticmethod
     def _filter_field_label(field):
@@ -6570,7 +6774,7 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker = AnalysisWorker(
             generation,
-            self.df.fillna("").to_dict("records"),
+            self.df,
             self.current_file,
         )
         worker.moveToThread(thread)
@@ -7188,13 +7392,42 @@ class MainWindow(QMainWindow):
         # containing its own table/detail controls.
 
     def refresh_investigation(self):
-        if (
-            self._analysis_cache
-            and len(self.filtered_df) == len(self.df)
-        ):
+        # NEVER run build_investigation_report on the GUI thread: for a large
+        # loaded log it blocks the event loop for seconds and Windows shows
+        # "Not responding". The background AnalysisWorker owns that compute;
+        # this method only renders its cached result.
+        if self._analysis_cache and len(self.filtered_df) == len(self.df):
             report = self._analysis_cache.get("report", {})
+        elif self._analysis_cache:
+            # Filtered view: filter the cached full-dataset candidates by the
+            # visible lines (cheap set membership) instead of re-analyzing.
+            full_report = self._analysis_cache.get("report", {})
+            cached_events = full_report.get("investigation_events", []) or []
+            try:
+                visible_lines = set(
+                    pd.to_numeric(self.filtered_df.get("line"), errors="coerce").dropna().astype(int)
+                ) if "line" in self.filtered_df.columns and not self.filtered_df.empty else None
+            except Exception:
+                visible_lines = None
+            report = dict(full_report)
+            if visible_lines:
+                report["investigation_events"] = [
+                    item for item in cached_events
+                    if str(item.get("line", "")).strip().lstrip("0") in
+                    {str(x) for x in visible_lines}
+                    or (str(item.get("line", "")).strip().isdigit()
+                        and int(str(item.get("line")).strip()) in visible_lines)
+                ]
+            else:
+                report["investigation_events"] = cached_events
         else:
-            report = build_investigation_report(self.filtered_df)
+            report = {
+                "investigation_events": [],
+                "critical_count": 0,
+                "high_count": 0,
+                "medium_count": 0,
+                "pending": True,
+            }
         events = report.get("investigation_events", [])
         self._investigation_events = list(events)
 
@@ -7205,6 +7438,7 @@ class MainWindow(QMainWindow):
         self.investigation_summary.setText(
             f"Candidates: {len(events)}  •  Critical: {report.get('critical_count', 0)}  •  "
             f"High: {report.get('high_count', 0)}  •  Medium: {report.get('medium_count', 0)}"
+            + ("  •  background analysis in progress…" if report.get("pending") else "")
         )
 
         self.investigation_table.setSortingEnabled(False)
@@ -7236,9 +7470,15 @@ class MainWindow(QMainWindow):
         self.investigation_table.setSortingEnabled(True)
 
         if not events:
-            self.investigation_detail.setPlainText(
-                "No investigation candidates matched the current log/filter."
-            )
+            if report.get("pending"):
+                self.investigation_detail.setPlainText(
+                    "Background analysis is still running for this log. Investigation candidates "
+                    "will appear here automatically when it completes."
+                )
+            else:
+                self.investigation_detail.setPlainText(
+                    "No investigation candidates matched the current log/filter."
+                )
             return
 
         # Keep the first candidate visible after a refresh, unless the user is

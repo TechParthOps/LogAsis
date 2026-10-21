@@ -26,13 +26,21 @@ def events_to_dataframe(events: Iterable[Any]) -> pd.DataFrame:
             df[col] = ""
 
     # IMPORTANT: timestamp stays a column. Never use df.index.dt.
+    # ``utc=True`` normalizes every parsed timestamp to one timezone-aware UTC
+    # dtype. Without it, mixed naive/aware input (or a file whose timestamps
+    # all fail to parse) produced an object-dtype column and the derived
+    # hour/date computation crashed, making the whole file unloadable.
     df["timestamp_dt"] = pd.to_datetime(
         df["timestamp"].astype(str),
         errors="coerce",
         format="mixed",
+        utc=True,
     )
 
     # Support "Aug 15 10:01:01" timestamps by attaching the current year.
+    # Note: this repair is intentionally retained for syslog compatibility but
+    # is documented as a known limitation (the implied year is the current
+    # year, so the same file may resolve differently in a later year).
     missing_year = df["timestamp_dt"].isna() & df["timestamp"].astype(str).str.len().gt(0)
     if missing_year.any():
         current_year = pd.Timestamp.now().year
@@ -42,11 +50,17 @@ def events_to_dataframe(events: Iterable[Any]) -> pd.DataFrame:
             ),
             errors="coerce",
             format="mixed",
+            utc=True,
         )
         df.loc[missing_year, "timestamp_dt"] = repaired
 
-    df["hour"] = df["timestamp_dt"].dt.hour
-    df["date"] = df["timestamp_dt"].dt.date.astype("string")
+    df["hour"] = df["timestamp_dt"].dt.hour.astype("Int64")
+    df["date"] = df["timestamp_dt"].dt.date.astype("string").fillna("")
+
+    # Flag records whose timestamp could not be parsed at all so coverage and
+    # validation layers can report them instead of silently dropping or crashing.
+    if df["timestamp_dt"].isna().any():
+        df["timestamp_parse_failed"] = df["timestamp_dt"].isna()
 
     # Preserve source-specific fields (for example Sysmon EventID, Image,
     # ParentImage, DestinationPort and Hashes). The normalized COLUMNS remain

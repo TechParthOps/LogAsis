@@ -20,6 +20,7 @@ from ai.large_log import build_large_log_context, evidence_to_prompt
 from ai.claim_grounding import normalize_provider_analysis, render_analyst_report
 from ai.investigation_agent import AgenticInvestigationRuntime
 from ai.providers import BaseAIProvider, get_provider
+from core.deterministic_qa import DeterministicQAEngine, context_from_questions
 
 
 _AI_SESSION_CACHE_VERSION = "v0.9.7-stable-answers"
@@ -244,6 +245,107 @@ def __getattr__(name: str):
 
 
 
+def render_deterministic_report(result: dict[str, Any]) -> str:
+    """Render a deterministic QA result as the analyst report.
+
+    Layout contract (user-facing):
+    - DIRECT ANSWER first, as short as possible. When the analyst found the
+      actual answer in the loaded log, no evidence listing is shown.
+    - EVIDENCE CHAIN appears only when no direct answer could be established
+      (verified zero, ambiguity, abstention) so the user can trace what the
+      answer relates to.
+    - Verbose grounding (filters, claims, complete identity list) is placed
+      after the EVIDENCE & GROUNDING DETAILS marker, which the UI renders in
+      the collapsible grounding panel.
+
+    Deterministic answers are computed by LogAsis itself from the indexed
+    dataset (no provider call and no model arithmetic), so their claims are
+    VERIFIED_FACT by construction.
+    """
+    lines: list[str] = []
+
+    direct = str(result.get("direct_answer") or "").strip()
+    answer = str(result.get("answer") or "").strip()
+    has_direct = bool(result.get("has_direct_answer")) and bool(direct)
+    body = direct if has_direct else (answer or "The deterministic layer could not answer this question from the schema.")
+
+    lines += ["DIRECT ANSWER", body]
+
+    evidence_records = result.get("evidence_records", []) or []
+    total_ids = int(result.get("evidence_id_count", 0) or len(result.get("evidence_ids_all", [])))
+
+    # Evidence chain only when the direct answer is not the whole story.
+    if not has_direct or result.get("kind") in {"abstention"}:
+        if evidence_records:
+            lines += ["", "EVIDENCE CHAIN (most relevant records)"]
+            for rec in evidence_records[:8]:
+                ident = f" (source id: {rec['source_identity']})" if rec.get("source_identity") else ""
+                message = str(rec.get("message", "") or "")[:110]
+                lines.append(
+                    f"- [{rec['evidence_id']}] {rec.get('timestamp', '')} "
+                    f"type={rec.get('event_type', '') or 'n/a'} action={rec.get('action', '') or 'n/a'}"
+                    + (f" — {message}" if message else "")
+                    + ident
+                )
+            if total_ids > len(evidence_records):
+                lines.append(f"- … {total_ids - len(evidence_records)} further matching records (complete identity list below).")
+
+    coverage = result.get("coverage", {}) or {}
+    if coverage:
+        status = coverage.get("coverage_status", "UNKNOWN")
+        reason = coverage.get("completion_reason", "")
+        line = f"COVERAGE: {status}"
+        if reason:
+            line += f" — {reason}"
+        lines += ["", line]
+
+    # Verbose grounding: rendered in the collapsible panel by the UI.
+    lines += ["", "EVIDENCE & GROUNDING DETAILS"]
+    lines.append("This answer was computed by LogAsis's deterministic query engine over the loaded dataset.")
+    lines.append("No AI provider call was required and no model-generated arithmetic was used.")
+    filters = result.get("filters", {}) or {}
+    if filters:
+        lines.append(
+            "Query (validated, deterministic): " + ", ".join(f"{k}={v}" for k, v in filters.items())
+        )
+
+    claims = result.get("claims", []) or []
+    if claims:
+        lines += ["", "CLAIM GROUNDING"]
+        for claim in claims[:10]:
+            refs = " ".join(f"[{r}]" for r in claim.get("evidence_references", [])[:8])
+            suffix = f" {refs}" if refs else ""
+            lines.append(f"- {claim.get('type', '')}: {claim.get('text', '')}{suffix}")
+
+    notes = result.get("interpretation_notes", []) or []
+    if notes:
+        lines += ["", "INTERPRETATION NOTES"]
+        lines.extend(f"- {n}" for n in notes[:8])
+
+    evidence_ids_all = result.get("evidence_ids_all", []) or []
+    if evidence_records:
+        lines += ["", "SAMPLE EVIDENCE RECORDS"]
+        for rec in evidence_records[:10]:
+            ident = f" (source id: {rec['source_identity']})" if rec.get("source_identity") else ""
+            lines.append(
+                f"- [{rec['evidence_id']}] {rec.get('timestamp', '')} host={rec.get('host', '') or 'n/a'} "
+                f"type={rec.get('event_type', '') or 'n/a'} action={rec.get('action', '') or 'n/a'}{ident}"
+            )
+    lines.append(
+        "Evidence collected: " + (", ".join(evidence_ids_all[:400]) if evidence_ids_all else "none")
+    )
+    if len(evidence_ids_all) > 400:
+        lines.append(f"(+{len(evidence_ids_all) - 400} further evidence IDs)")
+    lines += [
+        "",
+        "LIMITATIONS",
+        "- Deterministic results describe the loaded dataset only. Absence of matching events does not",
+        "  prove that such events never occurred outside the dataset or logging coverage.",
+        "- Counts are computed over the complete matching set of the stated filters, not a sample.",
+    ]
+    return "\n".join(lines)
+
+
 class LogInvestigatorAgent:
     """Provider-facing AI investigation agent.
 
@@ -273,16 +375,26 @@ class LogInvestigatorAgent:
         return str(self.provider.generate(system_prompt, user_prompt) or "")
 
     @staticmethod
+    def _deterministic_possible(df) -> bool:
+        return isinstance(df, pd.DataFrame) and not df.empty
+
+    @staticmethod
     def _normalize_dataframe(df):
         if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        # Derived columns already present (the normal LogDataset path) — avoid
+        # a full-frame copy per question; large logs made every AI question
+        # pay a multi-second DataFrame copy here.
+        required = {"timestamp_dt", "hour", "date"}
+        if required.issubset(df.columns):
             return df
         result = df.copy()
         if "timestamp_dt" not in result.columns and "timestamp" in result.columns:
             result["timestamp_dt"] = pd.to_datetime(
-                result["timestamp"].astype(str), errors="coerce", format="mixed"
+                result["timestamp"].astype(str), errors="coerce", format="mixed", utc=True
             )
         if "hour" not in result.columns and "timestamp_dt" in result.columns:
-            result["hour"] = result["timestamp_dt"].dt.hour
+            result["hour"] = result["timestamp_dt"].dt.hour.astype("Int64")
         if "date" not in result.columns and "timestamp_dt" in result.columns:
             result["date"] = result["timestamp_dt"].dt.date.astype("string")
         return result
@@ -301,6 +413,10 @@ class LogInvestigatorAgent:
                 "evidence_ids": [str(r.get("evidence_id", "")).upper() for r in evidence_records],
                 "evidence_bundle_version": "ai-investigation-1",
             },
+            # Deterministic full-dataset count results from the investigation
+            # runtime let claim grounding verify set-level numbers against
+            # authoritative query output instead of a bounded sample.
+            "deterministic_counts": list(investigation.get("deterministic_counts") or []),
             "auto_cite_uncited_claims": True,
         }
         normalized = normalize_provider_analysis(provider_answer, context)
@@ -333,11 +449,11 @@ class LogInvestigatorAgent:
         )
         return report
 
-    def answer(self, question: str, df, source_file: str | None = None, dataset=None):
+    def answer(self, question: str, df, source_file: str | None = None, dataset=None, conversation_context: list[str] | None = None):
         question = str(question or "").strip()
         if not question:
             raise ValueError("Enter an investigation question.")
-        if self.provider is None:
+        if self.provider is None and not self._deterministic_possible(df):
             raise RuntimeError("No AI provider selected.")
         df = self._normalize_dataframe(df)
         # Share the dataset's persistent EventIndex with retrieval and tools.
@@ -358,6 +474,28 @@ class LogInvestigatorAgent:
                 )
                 return str(self.provider.generate(SYSTEM_PROMPT, evidence_to_prompt(package["context"])) or "")
             raise ValueError("No parsed log evidence is available for investigation.")
+
+        # ------------------------------------------------------------------
+        # Deterministic factual layer.
+        # Factual questions (exact counts, empty results, timelines, abstention
+        # scaffolds for prove/cause questions) are answered by validated
+        # indexed queries over the complete dataset. No provider call and no
+        # model arithmetic is involved, so these answers are exact and
+        # reproducible. Questions that need interpretation fall through to the
+        # AI investigation runtime.
+        # ------------------------------------------------------------------
+        context_questions = list(conversation_context or [])
+        deterministic_result = None
+        try:
+            engine = DeterministicQAEngine(df, dataset)
+            context = context_from_questions(df, dataset, context_questions)
+            deterministic_result = engine.answer(question, context)
+        except Exception:
+            deterministic_result = None
+        if deterministic_result is not None and not deterministic_result.requires_ai:
+            result_dict = deterministic_result.to_dict(max_records=10)
+            self._progress(100, "Deterministic analysis complete (no provider call required).")
+            return render_deterministic_report(result_dict)
 
         early_cache_key = None
         if _provider_cache_enabled(self.provider):
@@ -423,9 +561,9 @@ class LogInvestigatorAgent:
         runtime = AgenticInvestigationRuntime(
             self.provider,
             progress_callback=self._progress,
-            max_steps=int(os.getenv("LOGASIS_AI_MAX_STEPS", "6")),
-            max_tool_calls=int(os.getenv("LOGASIS_AI_MAX_TOOL_CALLS", "12")),
-            max_evidence=int(os.getenv("LOGASIS_AI_MAX_EVIDENCE", "64")),
+            max_steps=int(os.getenv("LOGASIS_AI_MAX_STEPS", "3")),
+            max_tool_calls=int(os.getenv("LOGASIS_AI_MAX_TOOL_CALLS", "6")),
+            max_evidence=int(os.getenv("LOGASIS_AI_MAX_EVIDENCE", "48")),
         )
         raw_answer, investigation = runtime.run(question, df, source_file=source_file, dataset=dataset)
         report = self._render(raw_answer, investigation, question)

@@ -1,0 +1,79 @@
+{
+  "benchmark_dir": "E:\\LogAsis_AI_Analyst_Benchmark",
+  "files": [
+    {
+      "file": "logs/authentication_large.jsonl",
+      "expected_events": 2500,
+      "sha256_ok": true,
+      "notes": [],
+      "parsed_events": 2500,
+      "count_ok": true,
+      "indexed_events": 2500,
+      "identity_mapped": 2500
+    },
+    {
+      "file": "logs/web_security_large.jsonl",
+      "expected_events": 2500,
+      "sha256_ok": true,
+      "notes": [],
+      "parsed_events": 2500,
+      "count_ok": true,
+      "indexed_events": 2500,
+      "identity_mapped": 2500
+    },
+    {
+      "file": "logs/endpoint_process_large.jsonl",
+      "expected_events": 2500,
+      "sha256_ok": true,
+      "notes": [],
+      "parsed_events": 2500,
+      "count_ok": true,
+      "indexed_events": 2500,
+      "identity_mapped": 2500
+    },
+    {
+      "file": "logs/dns_firewall_large.jsonl",
+      "expected_events": 2500,
+      "sha256_ok": true,
+      "notes": [],
+      "parsed_events": 2500,
+      "count_ok": true,
+      "indexed_events": 2500,
+      "identity_mapped": 2500
+    },
+    {
+      "file": "logs/linux_audit_large.jsonl",
+      "expected_events": 2494,
+      "sha256_ok": true,
+      "notes": [],
+      "parsed_events": 2494,
+      "count_ok": true,
+      "indexed_events": 2494,
+      "identity_mapped": 2494
+    },
+    {
+      "file": "logs/mixed_enterprise_large.jsonl",
+      "expected_events": 2500,
+      "sha256_ok": true,
+      "notes": [],
+      "parsed_events": 2500,
+      "count_ok": true,
+      "indexed_events": 2500,
+      "identity_mapped": 2500
+    },
+    {
+      "file": "logs/parser_edge_cases.jsonl",
+      "expected_events": 5,
+      "sha256_ok": true,
+      "notes": [],
+      "parsed_events": 5,
+      "count_ok": true,
+      "indexed_events": 5,
+      "identity_mapped": 5
+    }
+  ],
+  "all_hashes_ok": true,
+  "all_counts_ok": true,
+  "total_events": 14999,
+  "prepared_at_utc": "2026-10-17T19:22:10.835083+00:00"
+}

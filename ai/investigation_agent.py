@@ -22,10 +22,29 @@ from ai.context import build_evidence_context
 from ai.claim_grounding import normalize_provider_analysis
 
 
-DEFAULT_MAX_STEPS = 4
-DEFAULT_MAX_TOOL_CALLS = 8
+DEFAULT_MAX_STEPS = 3
+DEFAULT_MAX_TOOL_CALLS = 6
 DEFAULT_MAX_EVIDENCE = 48
 DEFAULT_TOOL_RESULT = 12
+# Planner responses are tiny JSON actions; a bounded completion budget keeps
+# each planning round-trip fast instead of reserving a full 4k output.
+PLANNER_MAX_TOKENS = 350
+
+# Coverage statuses (semantics):
+#   COMPLETED_SUFFICIENT  - the agent finished and the collected evidence was
+#                           sufficient for the objective (or the objective was
+#                           answered deterministically).
+#   COMPLETED_INSUFFICIENT - the agent finished but evidence was incomplete;
+#                           the answer must disclose the gaps.
+#   PARTIAL               - stopped at the step/tool budget; findings cover
+#                           only part of the objective.
+#   FAILED                - provider/parser/query/runtime error prevented the
+#                           investigation.
+COMPLETED_SUFFICIENT = "COMPLETED_SUFFICIENT"
+COMPLETED_INSUFFICIENT = "COMPLETED_INSUFFICIENT"
+PARTIAL = "PARTIAL"
+FAILED = "FAILED"
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,6 +106,26 @@ class InvestigationState:
     steps: int = 0
     termination_reason: str = ""
     confidence: str = "LOW"
+    # Coverage accounting (semantics documented in docs/AI_INVESTIGATION.md).
+    coverage: dict[str, Any] = field(default_factory=lambda: {
+        "total_events": 0,
+        "indexed_events": 0,
+        "candidate_events": 0,
+        "total_matching_events": 0,
+        "retrieved_events": 0,
+        "correlated_events": 0,
+        "verified_evidence": 0,
+        "excluded_events": 0,
+        "failed_batches": 0,
+        "truncated_results": False,
+        "coverage_status": "UNKNOWN",
+        "completion_reason": "",
+    })
+    completion_status: str = PARTIAL
+    # Deterministic count observations gathered via the count_events tool.
+    # These are authoritative query results, never model estimates, and are
+    # reused by claim grounding to verify set-level counts.
+    deterministic_counts: list[dict[str, Any]] = field(default_factory=list)
     # Per-question retrieval trace. This is intentionally stored on the
     # investigation state, never in a process/global conversation object.
     retrieval_trace: dict[str, Any] = field(default_factory=dict)
@@ -119,7 +158,7 @@ class InvestigationState:
                 if value:
                     self.entities[kind].add(_truncate(value, 160))
 
-    def compact_context(self, limit: int = 12) -> dict[str, Any]:
+    def compact_context(self, limit: int = 12, text_limit: int = 650) -> dict[str, Any]:
         records = [
             self.evidence_records[e]
             for e in self.evidence_ids
@@ -134,7 +173,7 @@ class InvestigationState:
             "evidence": [
                 {
                     "evidence_id": r["evidence_id"],
-                    "text": _truncate(r.get("text", ""), 650),
+                    "text": _truncate(r.get("text", ""), text_limit),
                 }
                 for r in records
             ],
@@ -144,8 +183,41 @@ class InvestigationState:
             "observations": self.observations[-12:],
             "unresolved_questions": self.unresolved_questions[-8:],
             "actions_taken": self.actions_taken[-10:],
+            "deterministic_counts": self.deterministic_counts[-6:],
             "retrieval_trace": dict(self.retrieval_trace),
         }
+
+    def planner_context(self, limit: int = 8) -> dict[str, Any]:
+        """Compact context for the planning round-trips.
+
+        Kept small on purpose: planning happens once per step and a large
+        serialized state dominates the request latency without improving the
+        action choice. The final synthesis still receives the full evidence.
+        """
+        records = [
+            self.evidence_records[e]
+            for e in self.evidence_ids
+            if e in self.evidence_records
+        ]
+        records = records[-limit:]
+        context: dict[str, Any] = {
+            "objective": self.objective,
+            "steps": self.steps,
+            "tool_calls": self.tool_calls,
+            "entities": {k: sorted(v)[:12] for k, v in self.entities.items() if v},
+            "evidence": [
+                {"evidence_id": r["evidence_id"], "text": _truncate(r.get("text", ""), 220)}
+                for r in records
+            ],
+            "observations": self.observations[-8:],
+            "deterministic_counts": self.deterministic_counts[-4:],
+            "unresolved_questions": self.unresolved_questions[-4:],
+        }
+        if self.hypotheses:
+            context["hypotheses"] = self.hypotheses[-4:]
+        if self.relationships:
+            context["relationships"] = self.relationships[-8:]
+        return context
 
     def to_report_data(self) -> dict[str, Any]:
         return {
@@ -154,7 +226,10 @@ class InvestigationState:
             "steps": self.steps,
             "tool_calls": self.tool_calls,
             "termination_reason": self.termination_reason or "completed",
+            "completion_status": self.completion_status,
             "confidence": self.confidence,
+            "coverage": dict(self.coverage),
+            "deterministic_counts": list(self.deterministic_counts),
             "entities": {k: sorted(v) for k, v in self.entities.items() if v},
             "evidence_ids": list(self.evidence_ids),
             "evidence_records": [
@@ -343,6 +418,65 @@ class InvestigationToolLayer:
             "records": selected,
         }
 
+    def count_events(self, query: str = "", **filters: Any) -> dict[str, Any]:
+        """Deterministic exact count over the complete dataset.
+
+        Unlike search_events, this tool NEVER samples: the reported count is
+        computed over every matching row of the loaded dataset, so the model
+        never has to estimate totals from a bounded result page. Lexical query
+        terms and structured field filters are combined with AND semantics;
+        an empty, unconstrained call returns the dataset size.
+        """
+        limit = self.max_result
+        query_text = str(query or "").strip().lower()
+        qtokens = set(_tokens(query_text))
+        rows = []
+        candidates: dict[str, Any] | None = None
+        if self._index is not None and qtokens:
+            positions: set[int] = set()
+            for token in qtokens:
+                positions.update(self._index.match_postings(token))
+                positions.update(self._index.field_name_postings(token))
+            candidates = {
+                f"EVID-{pos + 1:03d}": self._catalog[f"EVID-{pos + 1:03d}"]
+                for pos in sorted(positions)
+                if f"EVID-{pos + 1:03d}" in self._catalog
+            }
+        source = candidates if candidates is not None else self._catalog
+        for evid, record in source.items():
+            values = [str(record.get("text", ""))]
+            source_fields = record.get("source_fields") or {}
+            values.extend(str(v) for v in source_fields.values())
+            haystack = " ".join(values).lower()
+            doc_tokens = set(_tokens(haystack))
+            matched = True
+            if query_text:
+                if not (qtokens & doc_tokens or query_text in haystack):
+                    matched = False
+            if matched:
+                for key, wanted_value in filters.items():
+                    if key in {"limit", "query"} or wanted_value in (None, ""):
+                        continue
+                    key_text = str(key)
+                    wanted = str(wanted_value).strip().lower()
+                    actual = record.get(key_text, source_fields.get(key_text, ""))
+                    if wanted and wanted != str(actual or "").strip().lower():
+                        matched = False
+                        break
+            if matched:
+                rows.append(evid)
+        total = len(rows)
+        sample_ids = rows[:limit]
+        return {
+            "tool": "count_events",
+            "query": query_text,
+            "exact_count": total,
+            "exhaustive": True,
+            "dataset_size": len(self._catalog),
+            "sample_evidence_ids": sample_ids,
+            "sample_truncated": total > len(sample_ids),
+        }
+
     def get_timeline(self, evidence_ids: list[str] | None = None, entity_type: str = "", entity_value: str = "", **_: Any) -> dict[str, Any]:
         records = self._records([_canonical_evidence_id(x) for x in (evidence_ids or [])])
         if not records and entity_value:
@@ -476,6 +610,7 @@ class InvestigationToolLayer:
         safe = {
             "overview": self.overview,
             "search_events": self.search_events,
+            "count_events": self.count_events,
             "get_timeline": self.get_timeline,
             "correlate": self.correlate,
             "entity_context": self.entity_context,
@@ -508,11 +643,18 @@ class AgenticInvestigationRuntime:
         except Exception:
             pass
 
-    def _generate(self, system: str, user: str) -> str:
+    def _generate(self, system: str, user: str, *, max_tokens: int | None = None) -> str:
         generator = getattr(self.provider, "generate_with_progress", None)
         if callable(generator):
-            return str(generator(system, user, progress_callback=self._progress) or "")
-        return str(self.provider.generate(system, user) or "")
+            try:
+                return str(generator(system, user, progress_callback=self._progress, max_tokens=max_tokens) or "")
+            except TypeError:
+                # Providers whose generate_with_progress predates max_tokens.
+                return str(generator(system, user, progress_callback=self._progress) or "")
+        try:
+            return str(self.provider.generate(system, user, max_tokens=max_tokens) or "")
+        except TypeError:
+            return str(self.provider.generate(system, user) or "")
 
     def _generate_final(self, system: str, user: str, source_file: str | None = None) -> str:
         # Providers that support native file analysis (for example Gemini File
@@ -572,6 +714,7 @@ class AgenticInvestigationRuntime:
     def _planner_prompt(self, state: InvestigationState) -> str:
         tools = {
             "search_events": "Search any parsed evidence fields using a natural-language query or exact field filters.",
+            "count_events": "Exact deterministic count of events matching a query and/or field filters over the COMPLETE dataset (no sampling). Use this for any 'how many' question.",
             "get_timeline": "Build a chronological view for evidence IDs or a field/value entity.",
             "correlate": "Find generic entity and temporal relationships among selected evidence records.",
             "entity_context": "Return all records containing a selected value in a chosen field.",
@@ -591,13 +734,27 @@ class AgenticInvestigationRuntime:
             "Arguments may include query, evidence_ids, entity_type, entity_value, field_name, source_ip, username, "
             "process_name, event_type, action, severity, window_seconds, limit.\n\n"
             f"User objective: {state.objective}\n"
-            f"Current investigation state: {json.dumps(state.compact_context(), ensure_ascii=False, default=str)}"
+            f"Current investigation state: {json.dumps(state.planner_context(), ensure_ascii=False, default=str)}"
         )
 
 
     def _apply_result(self, state: InvestigationState, result: dict[str, Any]) -> None:
         records = result.get("records", []) or []
         state.add_records(records)
+        if result.get("tool") == "count_events":
+            # Deterministic count results are authoritative query output; keep
+            # them verbatim for synthesis and claim verification.
+            state.deterministic_counts.append({
+                "query": result.get("query", ""),
+                "exact_count": result.get("exact_count", 0),
+                "dataset_size": result.get("dataset_size", 0),
+                "sample_evidence_ids": result.get("sample_evidence_ids", [])[:12],
+                "exhaustive": True,
+            })
+            state.observations.append(
+                f"Deterministic count: {result.get('exact_count', 0)} matching event(s) "
+                f"out of {result.get('dataset_size', 0)} in the dataset (exhaustive, no sampling)."
+            )
         if result.get("relationships"):
             state.relationships.extend(result["relationships"][:50])
         if result.get("tool") == "get_timeline":
@@ -682,6 +839,108 @@ class AgenticInvestigationRuntime:
         )
         self._progress(10, "RAG retrieved initial evidence; AI is refining the investigation…")
 
+        # Deterministic head start: resolve the question's concrete entities
+        # against the schema and record authoritative counts BEFORE any
+        # planner round-trip. This frequently removes tool calls entirely and
+        # guarantees the synthesis cites real dataset numbers.
+        try:
+            if tools._index is not None:
+                from core.question_understanding import QuestionSchema, analyze_question
+
+                schema = QuestionSchema(tools._index)
+                analysis = analyze_question(objective, schema)
+                head_filters: dict[str, str] = {}
+                for ent in analysis.entities:
+                    if ent.field in schema.fields and schema.has_value(ent.field, ent.value):
+                        head_filters[ent.field] = ent.value
+                    if len(head_filters) >= 4:
+                        break
+                if head_filters:
+                    counted = tools.count_events(**head_filters)
+                    state.deterministic_counts.append({
+                        "query": ", ".join(f"{k}={v}" for k, v in head_filters.items()),
+                        "exact_count": counted.get("exact_count", 0),
+                        "dataset_size": counted.get("dataset_size", 0),
+                        "sample_evidence_ids": counted.get("sample_evidence_ids", [])[:12],
+                        "exhaustive": True,
+                    })
+                    state.observations.append(
+                        f"Deterministic count: {counted.get('exact_count', 0)} matching event(s) for "
+                        f"{', '.join(f'{k}={v}' for k, v in head_filters.items())} "
+                        f"(exhaustive over {counted.get('dataset_size', 0)} events, no sampling)."
+                    )
+        except Exception:
+            pass
+
+        # Deterministic incident profile: when the log contains a coherent
+        # intrusion sequence, seed the investigation with its evidence-backed
+        # facts so the planner starts from real forensic context instead of
+        # re-deriving (or hallucinating) them. Everything below is derived
+        # deterministically from the loaded records; the AI may refine,
+        # replace, or correlate it through the read-only tools.
+        try:
+            profile = None
+            if dataset is not None:
+                profile_getter = getattr(dataset, "get_incident_profile", None)
+                if callable(profile_getter):
+                    profile = profile_getter()
+            if profile is None and tools._index is not None:
+                from core.incident_profile import build_incident_profile
+                from core.question_understanding import QuestionSchema as _ProfileSchema
+
+                profile = build_incident_profile(
+                    df, tools._index, _ProfileSchema(tools._index)
+                )
+            if profile is not None and getattr(profile, "has_incident", False):
+                facts: list[str] = [
+                    f"Compromised account '{profile.compromised_user}': "
+                    f"{profile.failed_count} failed then {profile.success_count} successful "
+                    f"login(s) from {profile.attacker_ip}.",
+                ]
+                evidence_positions: list[int] = list(profile.login_positions[:8])
+                esc = profile.top_escalation
+                if esc is not None and not esc.get("check"):
+                    facts.append(
+                        f"Privilege escalation execution: `{esc.get('command', '')}` "
+                        f"(PID {esc.get('pid', '')})."
+                    )
+                    evidence_positions.append(int(esc.get("position", 0)))
+                top_cve = profile.top_cve_match
+                if top_cve:
+                    facts.append(
+                        f"Execution matches the {top_cve.get('cve', '')} signature "
+                        f"({top_cve.get('description', '')}); signature mapping, not a log string."
+                    )
+                shell = profile.root_shell
+                if shell is not None:
+                    facts.append(
+                        f"Root shell afterwards: `{shell.get('command', '')}` as uid=0 "
+                        f"(PID {shell.get('pid', '')})."
+                    )
+                    evidence_positions.append(int(shell.get("position", 0)))
+                for read in profile.root_sensitive_reads[:2]:
+                    facts.append(
+                        f"Sensitive read as root: `{read.get('command', '')}` "
+                        f"(PID {read.get('pid', '')})."
+                    )
+                    evidence_positions.append(int(read.get("position", 0)))
+                for tool_entry in profile.downloaded_tools[:1]:
+                    facts.append(
+                        f"Enumeration tooling: {tool_entry.get('tool', '')} from "
+                        f"{tool_entry.get('url', '')} (`{tool_entry.get('command', '')}`)."
+                    )
+                    evidence_positions.append(int(tool_entry.get("position", 0)))
+                if evidence_positions:
+                    evidence_ids = [
+                        _canonical_evidence_id(f"EVID-{p + 1:03d}")
+                        for p in evidence_positions
+                    ]
+                    state.add_records(tools._records(evidence_ids))
+                for fact in facts:
+                    state.observations.append(f"Incident profile: {fact}")
+        except Exception:
+            pass
+
         planner_system = (
             "You are the planning component of LogAsis AI investigation planner. Select only safe, read-only evidence operations. "
             "The application provides evidence access; you provide the investigation intelligence. "
@@ -694,17 +953,39 @@ class AgenticInvestigationRuntime:
                 break
             state.steps = step
             self._progress(15 + int((step - 1) * 45 / self.max_steps), f"Planning investigation step {step}…")
-            plan_obj = self._json_object(self._generate(planner_system, self._planner_prompt(state)))
+            plan_obj = None
+            provider_error = ""
+            for attempt, budget in enumerate((PLANNER_MAX_TOKENS, None)):
+                try:
+                    plan_obj = self._json_object(self._generate(planner_system, self._planner_prompt(state), max_tokens=budget))
+                    if plan_obj and isinstance(plan_obj.get("action"), str):
+                        break
+                except Exception as exc:
+                    provider_error = str(exc)
+                    plan_obj = None
+                if attempt == 0 and not plan_obj:
+                    # Reasoning models can exhaust a small planning budget with
+                    # hidden reasoning (finish_reason=length). Retry the same
+                    # step once with the provider's normal output budget before
+                    # treating the step as failed.
+                    continue
             if not plan_obj or not isinstance(plan_obj.get("action"), str):
                 # Recovery is another AI request, not a deterministic forensic fallback.
                 retry_prompt = self._planner_prompt(state) + (
                     "\nYour previous response could not be parsed. Return ONLY one JSON object with an action "
                     "from the available actions. Do not return prose or markdown."
                 )
-                plan_obj = self._json_object(self._generate(planner_system, retry_prompt))
+                try:
+                    plan_obj = self._json_object(self._generate(planner_system, retry_prompt))
+                except Exception as exc:
+                    provider_error = provider_error or str(exc)
+                    plan_obj = None
             if not plan_obj or not isinstance(plan_obj.get("action"), str):
                 state.termination_reason = "AI planner did not return a usable investigation action"
+                if provider_error:
+                    state.termination_reason += f" ({provider_error[:160]})"
                 state.unresolved_questions.append("The AI provider did not produce a usable investigation plan.")
+                state.completion_status = FAILED
                 break
             plan = plan_obj
             action = str(plan.get("action", "")).strip()
@@ -739,6 +1020,7 @@ class AgenticInvestigationRuntime:
             except Exception as exc:
                 state.actions_taken.append({"step": step, "tool": action, "status": "failed", "error": str(exc)})
                 state.unresolved_questions.append(f"Tool {action} failed: {exc}")
+                state.coverage["failed_batches"] = int(state.coverage.get("failed_batches", 0)) + 1
                 continue
 
             state.tool_calls += 1
@@ -775,9 +1057,61 @@ class AgenticInvestigationRuntime:
 
         state.confidence = "MODERATE" if len(state.evidence_ids) >= 2 else "LOW"
 
+        # Coverage accounting: distinguishing exhaustive, targeted, partial
+        # and failed investigations instead of labelling every budgeted run
+        # as complete.
+        finished_naturally = state.termination_reason.startswith("agent determined")
+        had_unresolved = bool(state.unresolved_questions)
+        if state.completion_status != FAILED:
+            if finished_naturally and not had_unresolved:
+                state.completion_status = COMPLETED_SUFFICIENT
+            elif finished_naturally and had_unresolved:
+                state.completion_status = COMPLETED_INSUFFICIENT
+            else:
+                state.completion_status = PARTIAL
+        correlated = sum(len(r.get("reasons") or []) for r in state.relationships[:40])
+        state.coverage.update({
+            "total_events": int(len(tools.df)),
+            "indexed_events": int(tools._index.size) if tools._index is not None else int(len(tools.df)),
+            "candidate_events": int(len(state.evidence_ids)),
+            "total_matching_events": int(state.deterministic_counts[-1]["exact_count"]) if state.deterministic_counts else len(state.evidence_ids),
+            "retrieved_events": len(state.evidence_records),
+            "correlated_events": correlated,
+            "verified_evidence": len(state.evidence_records),
+            "excluded_events": max(0, int(len(tools.df)) - len(state.evidence_ids)),
+            "truncated_results": any(
+                a.get("total_matches") is not None and int(a.get("total_matches", 0)) > a.get("result_count", 0)
+                for a in state.actions_taken
+            ),
+            "coverage_status": (
+                "COMPLETE" if state.completion_status == COMPLETED_SUFFICIENT
+                else "TARGETED" if state.completion_status == COMPLETED_INSUFFICIENT
+                else "PARTIAL"
+            ),
+            "completion_reason": state.termination_reason,
+        })
+
         # Final model call is synthesis only. It receives compact investigated
         # evidence and deterministic relationship/timeline data, never the full log.
         self._progress(70, "Synthesizing the investigated evidence…")
+        deterministic_section = ""
+        if state.deterministic_counts:
+            deterministic_section = (
+                "\n\nDeterministic count results (authoritative query output; use these exact numbers, "
+                "never estimates):\n" +
+                "\n".join(
+                    f"- {c.get('exact_count', 0)} matching event(s) for query '{c.get('query', '')}' "
+                    f"(dataset size {c.get('dataset_size', 0)}, exhaustive)"
+                    for c in state.deterministic_counts[-8:]
+                )
+            )
+        coverage_section = (
+            f"\n\nInvestigation coverage: {state.completion_status} "
+            f"({state.coverage.get('coverage_status', 'UNKNOWN')}); termination: {state.termination_reason}. "
+            + ("Disclose any incomplete coverage in the answer."
+               if state.completion_status in {PARTIAL, COMPLETED_INSUFFICIENT, FAILED}
+               else "Coverage was sufficient for the objective.")
+        )
         final_system = (
             "You are the final analyst component of LogAsis. Produce an evidence-grounded security assessment.\n"
             "Use only the investigation state and exact evidence records supplied below.\n"
@@ -801,7 +1135,9 @@ class AgenticInvestigationRuntime:
         )
         final_user = (
             f"Investigation objective: {objective}\n"
-            f"Investigation state:\n{json.dumps(state.compact_context(limit=20), ensure_ascii=False, default=str)}\n\n"
+            f"Investigation state:\n{json.dumps(state.compact_context(limit=20), ensure_ascii=False, default=str)}\n"
+            f"{deterministic_section}"
+            f"{coverage_section}\n\n"
             "Authoritative evidence index:\n" +
             "\n".join(
                 f"[{e}] {state.evidence_records[e].get('text','')}"

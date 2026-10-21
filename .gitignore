@@ -45,8 +45,15 @@ Thumbs.db
 # Build / packaging output
 build/
 dist/
+packaging/Output/
+packaging/version.iss
 *.spec
+!packaging/logasis.spec
 
 build-onedir/
 
 dist-onedir/
+
+# Generated training datasets
+training_exports/*
+!training_exports/.gitkeep

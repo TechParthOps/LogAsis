@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone as _timezone
 from typing import Any, Iterable
+
+_UTC = _timezone.utc
 
 
 class EventIndex:
@@ -78,27 +80,48 @@ class EventIndex:
 
     @staticmethod
     def _parse_timestamp(value: Any) -> datetime | None:
+        """Parse a timestamp and normalize it to UTC-aware.
+
+        Normalizing to UTC is required for sort/comparison safety: mixing
+        naive and timezone-aware datetimes anywhere in the sorted timestamp
+        array (or in range queries) raises ``TypeError`` in Python 3 and
+        previously crashed index builds on datasets with mixed formats.
+        Naive timestamps are treated as UTC; this is deterministic and
+        independent of the machine's local timezone.
+        """
         if not value:
             return None
         text = str(value).strip()
         if not text:
             return None
+        parsed: datetime | None = None
         try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
         except (ValueError, TypeError):
             pass
-        for fmt in (
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%d %H:%M:%S.%f",
-            "%b %d %H:%M:%S",
-            "%d/%b/%Y:%H:%M:%S",
-        ):
+        if parsed is None:
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%b %d %H:%M:%S",
+                "%d/%b/%Y:%H:%M:%S",
+            ):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except (ValueError, TypeError):
+                    continue
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
             try:
-                return datetime.strptime(text, fmt)
-            except (ValueError, TypeError):
-                continue
-        return None
+                from datetime import timezone as _timezone
+
+                return parsed.replace(tzinfo=_timezone.utc)
+            except Exception:
+                return parsed
+        return parsed.astimezone(_UTC)
 
     def build(self, events: Iterable[dict[str, Any]]) -> None:
         self._events = [dict(event) for event in events]
@@ -379,15 +402,29 @@ class EventIndex:
         return [self._events[p] for p in positions if 0 <= p < len(self._events)]
 
     def intersect(self, *position_sets: set[int] | list[int]) -> list[int]:
+        """Intersect position sets. Fails closed on empty conditions.
+
+        Semantics matter for correctness: an intersection over supplied
+        condition results is empty when ANY condition matched nothing. The
+        previous implementation dropped empty sets and returned every row
+        when all sets were empty, so an AND query with one non-matching
+        filter silently returned the entire dataset. Only a call with NO
+        condition sets at all (unfiltered) returns all rows.
+        """
         if not position_sets:
             return list(range(len(self._events)))
-        sets = [set(s) for s in position_sets if s]
-        if not sets:
-            return list(range(len(self._events)))
-        result = sets[0]
-        for s in sets[1:]:
-            result = result & s
-        return sorted(result)
+        result: set[int] | None = None
+        for s in position_sets:
+            as_set = set(s)
+            if not as_set:
+                return []
+            if result is None:
+                result = as_set
+            else:
+                result &= as_set
+            if not result:
+                return []
+        return sorted(result or set())
 
     def union(self, *position_sets: set[int] | list[int]) -> list[int]:
         if not position_sets:
