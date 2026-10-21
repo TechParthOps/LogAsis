@@ -139,13 +139,13 @@ The source tree may vary between releases. Major architectural areas have includ
 
 ```text
 LogAsis/
-â”œâ”€â”€ ai/             # AI Analyst, investigation and provider components
-â”œâ”€â”€ core/           # Event models, indexing, queries and correlation
-â”œâ”€â”€ gui/            # Graphical user interface
-â”œâ”€â”€ docs/           # Architecture and technical documentation
-â”œâ”€â”€ tests/          # Automated tests, when included
-â”œâ”€â”€ requirements.txt
-â””â”€â”€ README.md
+ai/             # AI Analyst, investigation and provider components
+core/           # Event models, indexing, queries and correlation
+gui/            # Graphical user interface
+docs/           # Architecture and technical documentation
+tests/          # Automated tests, when included
+requirements.txt
+README.md
 ```
 
 Consult the actual repository for the complete and current structure.
